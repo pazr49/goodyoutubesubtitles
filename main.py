@@ -28,14 +28,17 @@ def create_app() -> FastAPI:
         description="An API for generating YouTube subtitles from video or audio content"
     )
 
-    # Define allowed origins for development
-    # TODO: Add your production frontend URL(s) here when available
+    # Define allowed origins for development and production
+    # TODO: Add your *actual* production frontend URL(s) here later
     origins = [
+        # Development
         "http://localhost",
-        "http://localhost:8000", # If frontend runs on the same port sometimes
-        "http://localhost:3000", # Common React dev port
-        "http://localhost:8080", # Common dev port
-        "http://localhost:5173", # Common Vite dev port
+        "http://localhost:8000",
+        "http://localhost:3000",
+        "http://localhost:8080",
+        "http://localhost:5173",
+        # Production API URL (allows frontend hosted elsewhere to call API)
+        "https://past-oven-production.up.railway.app", 
     ]
 
     # Add CORS middleware
