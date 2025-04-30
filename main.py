@@ -4,7 +4,7 @@ import uuid
 import math
 import logging
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from moviepy.editor import VideoFileClip
+from moviepy.video.io.VideoFileClip import VideoFileClip
 from elevenlabs.client import ElevenLabs
 from dotenv import load_dotenv
 
