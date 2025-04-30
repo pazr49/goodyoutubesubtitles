@@ -3,10 +3,19 @@ import shutil
 import uuid
 import math
 import logging
-from fastapi import FastAPI, UploadFile, File, HTTPException
+# import subprocess # Remove subprocess import
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from elevenlabs.client import ElevenLabs
 from dotenv import load_dotenv
+# Use pytubefix imports
+try:
+    from pytubefix import YouTube
+    from pytubefix.exceptions import PytubeFixError # Use pytubefix exception
+    # No need for request object from pytubefix for basic usage
+except ImportError:
+    YouTube = None
+    PytubeFixError = None
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -146,6 +155,107 @@ def save_transcript_to_file(transcript_text: str, original_filename: str) -> str
 
     return transcript_path
 
+def _process_video_to_sbv(video_path: str, original_filename: str) -> str:
+    """Internal helper to process a local video file to an SBV transcript file."""
+    logger.info(f"[_process_video_to_sbv] Processing video file: {video_path} from original: {original_filename}") # Added identifier
+    if not client:
+        logger.error("[_process_video_to_sbv] ElevenLabs client is not initialized.")
+        raise HTTPException(status_code=500, detail="ElevenLabs client not initialized. Check API key.")
+
+    # Use a unique ID based on the video path for derived files
+    base_name = os.path.splitext(os.path.basename(video_path))[0]
+    extracted_audio_filename = f"{base_name}.mp3"
+    extracted_audio_path = os.path.join(TEMP_DIR, extracted_audio_filename)
+
+    transcript_text = ""
+    transcript_file_path = ""
+
+    try:
+        # 1. Extract Audio (moved from endpoint)
+        logger.info(f"[_process_video_to_sbv] Starting audio extraction from {video_path} to {extracted_audio_path}")
+        video_clip = VideoFileClip(video_path)
+        video_clip.audio.write_audiofile(extracted_audio_path, codec='mp3', bitrate="320k", logger=None) # Suppress moviepy logs if desired
+        video_clip.close()
+        logger.info("[_process_video_to_sbv] Audio extraction complete.")
+
+        # 2. Call ElevenLabs Speech-to-Text (moved from endpoint)
+        logger.info(f"[_process_video_to_sbv] Sending audio {extracted_audio_path} to ElevenLabs...")
+        with open(extracted_audio_path, 'rb') as audio_f:
+            response = client.speech_to_text.convert(
+                file=audio_f,
+                model_id='scribe_v1'
+            )
+        logger.info("[_process_video_to_sbv] ElevenLabs transcription received.")
+
+        # 3. Format Transcript (moved from endpoint)
+        if hasattr(response, 'words') and response.words:
+            logger.info("[_process_video_to_sbv] Formatting transcript...")
+            transcript_text = create_transcript_format(response.words)
+            # 4. Save transcript to .sbv file (moved from endpoint)
+            transcript_file_path = save_transcript_to_file(transcript_text, original_filename)
+            logger.info(f"[_process_video_to_sbv] Transcript saved to {transcript_file_path}")
+        else:
+            transcript_text = "Transcription complete but no words found or result format unexpected."
+            logger.warning(f"[_process_video_to_sbv] Unexpected ElevenLabs response or empty words for {original_filename}: {response}")
+
+    except Exception as e:
+        logger.error(f"[_process_video_to_sbv] Error during processing video {original_filename} (path: {video_path}): {e}", exc_info=True)
+        # Re-raise the exception to be caught by the endpoint handler
+        raise e
+    finally:
+        # 5. Cleanup Temporary Audio File (video cleanup handled by caller)
+        if os.path.exists(extracted_audio_path):
+            logger.info(f"[_process_video_to_sbv] Cleaning up temporary audio file: {extracted_audio_path}")
+            os.remove(extracted_audio_path)
+        else:
+            logger.warning(f"[_process_video_to_sbv] Temporary audio file not found for cleanup: {extracted_audio_path}")
+
+    logger.info(f"[_process_video_to_sbv] Finished processing. Returning SBV path: {transcript_file_path}")
+    return transcript_file_path # Return the path to the generated SBV file
+
+# --- NEW AUDIO PROCESSING HELPER ---
+def _process_audio_to_sbv(audio_path: str, original_filename_base: str) -> str:
+    """Internal helper to process a local audio file to an SBV transcript file."""
+    logger.info(f"[_process_audio_to_sbv] Processing audio file: {audio_path} from original base: {original_filename_base}")
+    if not client:
+        logger.error("[_process_audio_to_sbv] ElevenLabs client is not initialized.")
+        raise HTTPException(status_code=500, detail="ElevenLabs client not initialized. Check API key.")
+
+    transcript_text = ""
+    transcript_file_path = ""
+
+    try:
+        # 1. Call ElevenLabs Speech-to-Text (directly with audio path)
+        logger.info(f"[_process_audio_to_sbv] Sending audio {audio_path} to ElevenLabs...")
+        with open(audio_path, 'rb') as audio_f:
+            response = client.speech_to_text.convert(
+                file=audio_f,
+                model_id='scribe_v1'
+            )
+        logger.info("[_process_audio_to_sbv] ElevenLabs transcription received.")
+
+        # 2. Format Transcript
+        if hasattr(response, 'words') and response.words:
+            logger.info("[_process_audio_to_sbv] Formatting transcript...")
+            transcript_text = create_transcript_format(response.words)
+            # 3. Save transcript to .sbv file
+            # Use the original base name provided (e.g., video title)
+            transcript_file_path = save_transcript_to_file(transcript_text, original_filename_base)
+            logger.info(f"[_process_audio_to_sbv] Transcript saved to {transcript_file_path}")
+        else:
+            transcript_text = "Transcription complete but no words found or result format unexpected."
+            logger.warning(f"[_process_audio_to_sbv] Unexpected ElevenLabs response or empty words for {original_filename_base}: {response}")
+
+    except Exception as e:
+        logger.error(f"[_process_audio_to_sbv] Error during processing audio file {audio_path}: {e}", exc_info=True)
+        # Re-raise the exception to be caught by the endpoint handler
+        raise e
+    # No finally block needed here, cleanup is handled by the caller endpoint
+    # because this function receives the temp file path directly.
+
+    logger.info(f"[_process_audio_to_sbv] Finished processing. Returning SBV path: {transcript_file_path}")
+    return transcript_file_path
+
 # --- API Endpoints ---
 @app.get("/ping")
 async def ping():
@@ -156,74 +266,135 @@ async def ping():
 async def root():
     return {"message": "Hello from the Python API!"}
 
-@app.post("/transcribe-video") # Renamed endpoint for clarity
+@app.post("/transcribe-video")
 async def transcribe_video(video_file: UploadFile = File(...)):
-    """Accepts MP4 video, extracts audio, transcribes using ElevenLabs, and returns formatted transcript file path."""
+    """Accepts video upload, extracts audio, transcribes, returns formatted transcript file path."""
 
-    if not client:
-         raise HTTPException(status_code=500, detail="ElevenLabs client not initialized. Check API key.")
-
-    if not video_file.filename.endswith((".mp4", ".mov", ".avi", ".mkv")): # Added more video types
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a video file (e.g., MP4, MOV).")
+    # Basic validation remains here
+    allowed_extensions = {".mp4", ".mov", ".avi", ".mkv", ".webm"} # Added webm
+    file_extension = os.path.splitext(video_file.filename)[1].lower()
+    if file_extension not in allowed_extensions:
+        raise HTTPException(status_code=400, detail=f"Invalid file type '{file_extension}'. Allowed: {', '.join(allowed_extensions)}")
 
     unique_id = uuid.uuid4()
-    temp_video_path = os.path.join(TEMP_DIR, f"{unique_id}_{video_file.filename}")
-    extracted_audio_filename = f"{unique_id}.mp3"
-    extracted_audio_path = os.path.join(TEMP_DIR, extracted_audio_filename)
+    # Use a more robust temp filename based on UUID, keep original extension
+    temp_video_filename = f"{unique_id}{file_extension}"
+    temp_video_path = os.path.join(TEMP_DIR, temp_video_filename)
 
-    transcript_text = ""
-    transcript_file_path = ""
-
+    transcript_file_path = None
     try:
         # 1. Save Uploaded Video
+        logger.info(f"Saving uploaded video {video_file.filename} to {temp_video_path}")
         with open(temp_video_path, "wb") as buffer:
             shutil.copyfileobj(video_file.file, buffer)
+        logger.info("Video saved.")
 
-        # 2. Extract Audio
-        video_clip = VideoFileClip(temp_video_path)
-        # Use a high bitrate for potentially better quality for STT
-        video_clip.audio.write_audiofile(extracted_audio_path, codec='mp3', bitrate="320k")
-        video_clip.close()
-
-        # 3. Call ElevenLabs Speech-to-Text
-        with open(extracted_audio_path, 'rb') as audio_f:
-            # According to docs, convert expects file, model_id
-            # Default timestamps_granularity is 'word' which is what we need.
-            response = client.speech_to_text.convert(
-                file=audio_f,
-                model_id='scribe_v1' # Corrected model ID for Speech-to-Text
-            )
-
-        # 4. Format Transcript
-        # Access 'words' directly from the response object
-        if hasattr(response, 'words') and response.words:
-             transcript_text = create_transcript_format(response.words)
-
-             # 5. Save transcript to .sbv file
-             transcript_file_path = save_transcript_to_file(transcript_text, video_file.filename)
-        else:
-             # Handle case where transcription might be empty or failed partially
-             transcript_text = "Transcription complete but no words found or result format unexpected."
-             # Log the actual response for debugging if needed
-             logger.warning(f"Unexpected ElevenLabs response format or empty words list for file {video_file.filename}: {response}")
-
+        # 2. Process video using the helper function
+        transcript_file_path = _process_video_to_sbv(temp_video_path, video_file.filename)
 
     except Exception as e:
-        # Log the full error for better debugging
-        logger.error(f"Error during processing video {video_file.filename}: {e}", exc_info=True)
+        # Catch potential errors from saving or processing
+        logger.error(f"Error in /transcribe-video endpoint for {video_file.filename}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error during processing: {str(e)}")
     finally:
-        # 6. Cleanup Temporary Files
+        # 3. Cleanup Temporary Video File
         if os.path.exists(temp_video_path):
+            logger.info(f"Cleaning up temporary video file: {temp_video_path}")
             os.remove(temp_video_path)
-        if os.path.exists(extracted_audio_path):
-             os.remove(extracted_audio_path)
         await video_file.close()
 
-    # 7. Return Formatted Transcript File Path
-    # Return just the filename or a path relative to some defined output dir
-    return {
-        "message": "Transcription successful",
-        "transcript_file": os.path.basename(transcript_file_path) if transcript_file_path else None
-        # Removed the full transcript text from the response for brevity
-    } 
+    # 4. Return result
+    if transcript_file_path:
+        return {
+            "message": "Transcription successful",
+            "transcript_file": os.path.basename(transcript_file_path)
+        }
+    else:
+        # This case might occur if _process_video_to_sbv returns None or empty path
+        raise HTTPException(status_code=500, detail="Transcription process completed but failed to generate file path.")
+
+@app.post("/transcribe-youtube")
+async def transcribe_youtube(url: str = Body(..., embed=True)):
+    """Accepts YouTube URL, downloads audio using pytubefix, transcribes, returns transcript file path."""
+    logger.info(f"[/transcribe-youtube] Received request for URL: {url}")
+    # Check pytubefix dependency
+    if not YouTube or not PytubeFixError:
+        logger.error("[/transcribe-youtube] Pytubefix dependency not available.")
+        raise HTTPException(status_code=501, detail="YouTube processing dependency (pytubefix) not installed or available.")
+
+    logger.info(f"[/transcribe-youtube] Processing URL: {url} using pytubefix (audio download)")
+
+    temp_audio_path = None
+    transcript_file_path = None
+    original_filename_base = "youtube_video" # Placeholder for base name (e.g., title)
+
+    try:
+        # --- Use pytubefix library to download AUDIO ---
+        logger.info(f"[/transcribe-youtube] Initializing YouTube object from pytubefix for {url}")
+        yt = YouTube(url)
+        logger.info(f"[/transcribe-youtube] YouTube object initialized. Video Title: '{yt.title}'")
+
+        # Get the best audio-only stream
+        logger.info("[/transcribe-youtube] Filtering for audio streams...")
+        # stream = yt.streams.get_audio_only() # Simple way, often picks webm/opus
+        # More specific filter for common formats like m4a (often better compatibility)
+        stream = yt.streams.filter(only_audio=True, file_extension='m4a').order_by('abr').desc().first()
+        if not stream:
+            logger.warning("[/transcribe-youtube] No M4A audio stream found, trying get_audio_only()...")
+            stream = yt.streams.get_audio_only()
+
+        if not stream:
+            logger.warning(f"[/transcribe-youtube] No suitable audio stream found for URL: {url}")
+            raise HTTPException(status_code=404, detail="No suitable audio stream found for this YouTube video.")
+        else:
+            logger.info(f"[/transcribe-youtube] Selected audio stream: {stream}")
+
+        # Use video title as the base for the SBV filename
+        original_filename_base = yt.title
+        # Download audio to temp dir with a unique name
+        unique_id = uuid.uuid4()
+        # Get extension from the stream (e.g., .m4a, .webm)
+        audio_extension = f".{stream.subtype}"
+        # Ensure stream.default_filename is safe (less critical with library, but keep)
+        # Use a simpler temp name since we base SBV on title
+        temp_audio_filename = f"{unique_id}_youtube_audio{audio_extension}"
+        temp_audio_path = os.path.join(TEMP_DIR, temp_audio_filename)
+
+        logger.info(f"[/transcribe-youtube] Attempting to download audio '{yt.title}' to {temp_audio_path}")
+        stream.download(output_path=TEMP_DIR, filename=temp_audio_filename)
+        logger.info(f"[/transcribe-youtube] YouTube audio download complete: {temp_audio_path}")
+        # --- End pytubefix audio download modification ---
+
+        # Process the downloaded audio using the new helper function
+        logger.info(f"[/transcribe-youtube] Calling _process_audio_to_sbv for {temp_audio_path}")
+        transcript_file_path = _process_audio_to_sbv(temp_audio_path, original_filename_base)
+        logger.info(f"[/transcribe-youtube] _process_audio_to_sbv finished for {temp_audio_path}")
+
+    # Catch pytubefix specific exceptions if needed, otherwise general Exception
+    except PytubeFixError as e:
+        logger.error(f"[/transcribe-youtube] PytubeFixError occurred for URL {url}: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Error processing YouTube URL (PytubeFixError): {str(e)}")
+    except Exception as e:
+        logger.error(f"[/transcribe-youtube] Generic exception occurred for URL {url}: {e}", exc_info=True)
+        if isinstance(e, HTTPException):
+            raise e # Re-raise it directly
+        else:
+            raise HTTPException(status_code=500, detail=f"Error during processing: {str(e)}")
+    finally:
+        # Cleanup downloaded YouTube AUDIO file
+        if temp_audio_path and os.path.exists(temp_audio_path):
+            logger.info(f"[/transcribe-youtube] Cleaning up temporary YouTube audio file: {temp_audio_path}")
+            os.remove(temp_audio_path)
+        elif temp_audio_path:
+            logger.warning(f"[/transcribe-youtube] Temporary YouTube audio file {temp_audio_path} not found for cleanup (might have failed before creation).")
+
+    # Return result
+    if transcript_file_path:
+        logger.info(f"[/transcribe-youtube] Request successful. Returning SBV file: {os.path.basename(transcript_file_path)}")
+        return {
+            "message": "Transcription successful",
+            "transcript_file": os.path.basename(transcript_file_path)
+        }
+    else:
+        logger.error("[/transcribe-youtube] Processing finished but no transcript file path was generated.")
+        raise HTTPException(status_code=500, detail="Transcription process completed but failed to generate file path.") 
