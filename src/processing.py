@@ -2,14 +2,218 @@ import os
 import logging
 import uuid
 from typing import List, Any
+import shutil # Added for cleaning up chunk files
 
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from elevenlabs.client import ElevenLabs
+from pydub import AudioSegment # Added for audio manipulation
+# from pydub.utils import make_chunks # We might use this, or implement manually for overlap
 
 from .config import Config # Relative imports
-from .utils import format_timestamp, ends_with_sentence_end, save_transcript_to_file
+from .utils import format_timestamp, ends_with_sentence_end, save_transcript_to_file, clean_temp_file # Added clean_temp_file
 
 logger = logging.getLogger(__name__)
+
+# --- Constants for audio chunking ---
+CHUNK_LENGTH_S = 5 * 60  # 5 minutes in seconds
+OVERLAP_S = 5          # 5 seconds overlap
+
+def _split_audio_into_chunks(audio_path: str, original_name: str) -> List[tuple[str, float]]:
+    """
+    Splits an audio file into chunks with overlap.
+    Returns a list of tuples: (chunk_file_path, chunk_start_time_seconds).
+    """
+    logger.info(f"Splitting audio file: {audio_path} into {CHUNK_LENGTH_S}s chunks with {OVERLAP_S}s overlap.")
+    chunk_paths_with_starts = []
+    
+    try:
+        audio = AudioSegment.from_file(audio_path)
+        logger.info(f"Audio duration: {len(audio) / 1000.0}s")
+    except Exception as e:
+        logger.error(f"Failed to load audio file {audio_path} with pydub: {e}", exc_info=True)
+        raise ValueError(f"Pydub failed to load audio: {e}")
+
+    chunk_length_ms = CHUNK_LENGTH_S * 1000
+    overlap_ms = OVERLAP_S * 1000
+    
+    # Calculate effective chunk length (how much to step forward each time)
+    step_ms = chunk_length_ms - overlap_ms
+    if step_ms <= 0:
+        logger.warning("Overlap is greater than or equal to chunk length. Audio will not be split effectively.")
+        # Handle this case: perhaps process as a single chunk if too short or step is invalid
+        if len(audio) <= chunk_length_ms: # If audio is shorter than one chunk
+            chunk_filename = f"{os.path.splitext(original_name)[0]}_chunk_0_{uuid.uuid4().hex[:8]}.{audio.format or 'mp3'}"
+            chunk_path = os.path.join(Config.TEMP_DIR, chunk_filename)
+            audio.export(chunk_path, format=audio.format or 'mp3')
+            logger.info(f"Audio shorter than a chunk or invalid step, processing as one: {chunk_path}")
+            return [(chunk_path, 0.0)]
+        else: # If step is invalid but audio is longer, adjust step to avoid issues.
+            step_ms = chunk_length_ms # Effectively no overlap if step_ms was problematic
+
+    idx = 0
+    current_pos_ms = 0
+    while current_pos_ms < len(audio):
+        chunk_start_ms = current_pos_ms
+        chunk_end_ms = current_pos_ms + chunk_length_ms
+        
+        # Ensure the chunk doesn't go beyond the audio length for the main part
+        # The actual segment might be shorter if it's the last one.
+        actual_chunk_end_ms = min(chunk_end_ms, len(audio))
+        
+        chunk = audio[chunk_start_ms:actual_chunk_end_ms]
+        
+        if len(chunk) == 0: # Should not happen if logic is correct
+            logger.warning(f"Empty chunk generated at index {idx}, start_ms {chunk_start_ms}. Skipping.")
+            current_pos_ms += step_ms
+            continue
+
+        # Use part of original name + chunk index + UUID for uniqueness
+        chunk_base_name = os.path.splitext(original_name)[0]
+        # Determine file extension from pydub's audio segment if possible, else default
+        file_extension = getattr(audio, 'format', os.path.splitext(audio_path)[1].lstrip('.'))
+        if not file_extension: # Fallback if format is not detected or path has no extension
+            file_extension = "mp3" # A common default
+
+        chunk_filename = f"{chunk_base_name}_chunk_{idx}_{uuid.uuid4().hex[:8]}.{file_extension}"
+        chunk_path = os.path.join(Config.TEMP_DIR, chunk_filename)
+        
+        try:
+            logger.info(f"Exporting chunk {idx}: {chunk_path} (covers {chunk_start_ms/1000.0}s to {actual_chunk_end_ms/1000.0}s of original)")
+            chunk.export(chunk_path, format=file_extension)
+            chunk_paths_with_starts.append((chunk_path, chunk_start_ms / 1000.0))
+        except Exception as e:
+            logger.error(f"Failed to export audio chunk {chunk_path}: {e}", exc_info=True)
+            # Decide if we should skip this chunk or raise an error
+            # For now, skip and log
+            
+        idx += 1
+        if actual_chunk_end_ms == len(audio): # Reached the end of the audio
+            break
+        current_pos_ms += step_ms
+        # Ensure we don't create a tiny sliver chunk at the very end if the step perfectly aligns
+        # or if the remaining audio is smaller than the overlap.
+        if len(audio) - current_pos_ms < overlap_ms and current_pos_ms < len(audio) :
+             # If remaining part is smaller than overlap, and we haven't finished,
+             # it means the previous chunk already covered most of this.
+             # We can stop, or adjust the last chunk to cover everything.
+             # The current logic should already handle this by min(chunk_end_ms, len(audio))
+             pass
+
+
+    if not chunk_paths_with_starts and len(audio) > 0:
+        # If splitting resulted in no chunks (e.g., very short audio not caught by initial check)
+        # Treat the whole audio as a single chunk.
+        logger.warning(f"Splitting resulted in no chunks for {audio_path}. Treating as a single chunk.")
+        single_chunk_filename = f"{os.path.splitext(original_name)[0]}_single_chunk_{uuid.uuid4().hex[:8]}.{getattr(audio, 'format', 'mp3')}"
+        single_chunk_path = os.path.join(Config.TEMP_DIR, single_chunk_filename)
+        audio.export(single_chunk_path, format=getattr(audio, 'format', 'mp3'))
+        return [(single_chunk_path, 0.0)]
+        
+    logger.info(f"Successfully split audio into {len(chunk_paths_with_starts)} chunks.")
+    return chunk_paths_with_starts
+
+def _stitch_transcriptions(chunk_word_data_list: List[tuple[List[Any], float]], overlap_s: float) -> List[Any]:
+    """
+    Stitches word data from multiple chunks, handling overlaps.
+    chunk_word_data_list: List of (list of word objects, chunk_start_time_in_original_audio_seconds)
+    overlap_s: The duration of the overlap in seconds.
+    """
+    logger.info(f"Stitching {len(chunk_word_data_list)} transcript chunks with {overlap_s}s overlap.")
+    stitched_words = []
+    last_global_end_time = 0.0  # Tracks the end time of the last word added from the *previous* chunk
+
+    for i, (words_from_chunk, chunk_original_start_s) in enumerate(chunk_word_data_list):
+        logger.debug(f"Processing chunk {i} which originally started at {chunk_original_start_s}s.")
+        
+        current_chunk_processed_words = []
+        for word_info in words_from_chunk:
+            if not all(hasattr(word_info, attr) for attr in ['text', 'start', 'end', 'type']) or word_info.type != 'word':
+                continue
+
+            # Adjust word timestamps to be relative to the global timeline
+            global_word_start = word_info.start + chunk_original_start_s
+            global_word_end = word_info.end + chunk_original_start_s
+
+            # Create a new word object or update existing to avoid modifying original response objects if they are complex
+            # For now, let's assume word_info can be augmented with global times if not already dicts
+            # A safer way would be to create new dicts/objects:
+            adjusted_word_info = {
+                'text': word_info.text,
+                'start': global_word_start,
+                'end': global_word_end,
+                'type': 'word' 
+                # copy other relevant attributes if ElevenLabs response.words items have more
+            }
+            # If word_info is an object with attributes:
+            # word_info.global_start = global_word_start (add new attribute)
+            # word_info.global_end = global_word_end
+
+            current_chunk_processed_words.append(adjusted_word_info)
+
+        if i == 0: # First chunk
+            stitched_words.extend(current_chunk_processed_words)
+            if stitched_words:
+                last_global_end_time = stitched_words[-1]['end']
+            logger.debug(f"Added {len(current_chunk_processed_words)} words from the first chunk. Last end time: {last_global_end_time}")
+        else:
+            # For subsequent chunks, only add words that start after the last added word from the previous chunk,
+            # considering the overlap.
+            # We want to find the point in the current_chunk_processed_words that truly follows last_global_end_time.
+            # The overlap means the current chunk started transcribing 'overlap_s' seconds *before* last_global_end_time
+            # (approximately, as chunk_original_start_s is the actual start).
+            
+            # Words from the current chunk should be added if their start time is
+            # greater than or equal to the effective end of the previous useful segment.
+            # The previous chunk's words went up to last_global_end_time.
+            # The current chunk started at chunk_original_start_s.
+            # The overlap region is from chunk_original_start_s to chunk_original_start_s + overlap_s.
+            # We trust the words from the *previous* chunk for times < chunk_original_start_s + overlap_s.
+            # So, we take words from the *current* chunk that start at/after (chunk_original_start_s + overlap_s)
+            # No, this is not quite right. We need to compare with last_global_end_time.
+
+            effective_start_for_this_chunk = last_global_end_time - overlap_s
+            
+            added_count = 0
+            for word_info in current_chunk_processed_words:
+                # word_info['start'] is already global here
+                if word_info['start'] >= last_global_end_time:
+                    stitched_words.append(word_info)
+                    added_count +=1
+                # A more sophisticated approach might try to find a seam in the overlap.
+                # For now, a hard cutoff: if current word starts after previous chunk's last word, add it.
+                # This might lose a fraction of a word if cut exactly.
+                # A slightly better heuristic: if a word starts *within* the overlap but *after* the previous last word's start + tiny_delta, consider it.
+                # Let's keep it simple: if it starts after the previous last_global_end_time, it's new.
+                # This means we prefer the end of the previous chunk over the start of the current one in the overlap.
+            
+            if stitched_words: # Update last_global_end_time with the newly added words
+                last_global_end_time = stitched_words[-1]['end']
+            logger.debug(f"Added {added_count} words from chunk {i}. Last end time now: {last_global_end_time}")
+
+    logger.info(f"Stitching complete. Total words: {len(stitched_words)}.")
+    # The 'words' objects from ElevenLabs might not be simple dicts.
+    # We need to ensure create_transcript_format can handle what we pass it.
+    # Let's convert our list of dicts back to a list of objects similar to what ElevenLabs returns, if necessary.
+    # For now, assuming create_transcript_format can handle list of dicts with 'text', 'start', 'end', 'type'.
+    # If not, we'd need to reconstruct objects:
+    # from elevenlabs.types.speech_to_text import Word # or similar
+    # final_words_objects = [Word(text=w['text'], start=w['start'], end=w['end'], type='word', confidence=1.0) for w in stitched_words]
+    # For now, let's assume our dicts are fine. We should check the `Word` object structure from `elevenlabs` sdk.
+    # Based on the original create_transcript_format, it expects objects with .text, .start, .end, .type attributes.
+    # So we need to convert back.
+    
+    class PseudoWord: # Helper class to mimic ElevenLabs Word object structure
+        def __init__(self, text, start, end, type='word'):
+            self.text = text
+            self.start = start
+            self.end = end
+            self.type = type
+            # Add other attributes if create_transcript_format uses them (e.g., confidence)
+            # For now, these are the ones checked in create_transcript_format.
+
+    final_pseudo_words = [PseudoWord(text=w['text'], start=w['start'], end=w['end']) for w in stitched_words]
+    return final_pseudo_words
+
 
 def create_transcript_format(
     words_data: List[Any],
@@ -107,42 +311,82 @@ def process_audio_to_transcript(
     client: ElevenLabs, # Type hint added
     original_name: str
 ) -> str:
-    """Process an audio file to generate transcript"""
-    logger.info(f"Processing audio file: {audio_path} (original: {original_name})")
+    """Process an audio file to generate transcript using chunking"""
+    logger.info(f"Processing audio file via chunking: {audio_path} (original: {original_name})")
     
     if not client:
         logger.error("process_audio_to_transcript called with uninitialized ElevenLabs client.")
         raise ValueError("ElevenLabs client is not available")
 
+    chunk_files_with_starts = []
+    all_chunk_word_data = [] # Stores (word_list_from_chunk, chunk_start_time_s)
+
     try:
-        # Send audio to ElevenLabs for transcription
-        logger.info(f"Sending audio to ElevenLabs model '{Config.ELEVENLABS_MODEL_ID}'")
-        with open(audio_path, 'rb') as audio_file:
-            response = client.speech_to_text.convert(
-                file=audio_file,
-                model_id=Config.ELEVENLABS_MODEL_ID
-            )
-        logger.info(f"Received transcription response from ElevenLabs for {original_name}.")
+        # 1. Split audio into chunks
+        logger.info("Step 1: Splitting audio into chunks...")
+        chunk_files_with_starts = _split_audio_into_chunks(audio_path, original_name)
         
-        # Check for valid response with words
-        if not hasattr(response, 'words') or not response.words:
-            logger.warning(f"Empty or invalid transcription response for {original_name}. Response: {response}")
-            # Consider if this should be an error or just an empty transcript
-            raise ValueError("Transcription service returned no words or invalid format")
+        if not chunk_files_with_starts:
+            logger.warning(f"Audio splitting yielded no chunks for {original_name}. Aborting transcription.")
+            raise ValueError("Audio splitting failed to produce any chunks.")
+
+        # 2. Process each chunk
+        logger.info(f"Step 2: Processing {len(chunk_files_with_starts)} audio chunks through ElevenLabs...")
+        for i, (chunk_path, chunk_start_s) in enumerate(chunk_files_with_starts):
+            logger.info(f"Processing chunk {i+1}/{len(chunk_files_with_starts)}: {chunk_path} (starts at {chunk_start_s}s)")
+            try:
+                with open(chunk_path, 'rb') as audio_chunk_file:
+                    response = client.speech_to_text.convert(
+                        file=audio_chunk_file,
+                        model_id=Config.ELEVENLABS_MODEL_ID
+                        # Add other parameters like language if needed
+                    )
+                
+                if hasattr(response, 'words') and response.words:
+                    logger.info(f"Received {len(response.words)} words from chunk {i+1}.")
+                    all_chunk_word_data.append((response.words, chunk_start_s))
+                else:
+                    logger.warning(f"Empty or invalid transcription response for chunk {chunk_path}. Response: {response}")
+            except Exception as e:
+                logger.error(f"Error transcribing audio chunk {chunk_path}: {e}", exc_info=True)
+                # Decide: skip chunk, or fail all? For now, continue if some chunks fail.
+                # This could lead to gaps in transcription.
+                # Consider adding a placeholder or specific error handling.
+            finally:
+                clean_temp_file(chunk_path) # Clean up individual chunk file
+
+        if not all_chunk_word_data:
+            logger.error(f"No words returned from any audio chunks for {original_name}.")
+            raise ValueError("Transcription service returned no words from any chunks.")
+
+        # 3. Stitch transcriptions
+        logger.info("Step 3: Stitching transcriptions from chunks...")
+        stitched_word_objects = _stitch_transcriptions(all_chunk_word_data, OVERLAP_S)
+        
+        if not stitched_word_objects:
+            logger.warning(f"Stitching resulted in no words for {original_name}.")
+            # This could be an empty transcript if audio was silent, or an error.
+            # For now, proceed to format, which will yield an empty string.
             
-        # Format transcript
-        logger.info("Formatting transcript...")
-        transcript_text = create_transcript_format(response.words)
+        # 4. Format transcript
+        logger.info("Step 4: Formatting final stitched transcript...")
+        transcript_text = create_transcript_format(stitched_word_objects) # Pass the stitched list of PseudoWord objects
         
-        # Save to file
-        logger.info("Saving transcript to file...")
+        # 5. Save to file
+        logger.info("Step 5: Saving final transcript to file...")
         transcript_path = save_transcript_to_file(transcript_text, original_name)
+        logger.info(f"Successfully processed and chunked audio: {original_name}. Transcript at: {transcript_path}")
         return transcript_path
         
     except Exception as e:
-        logger.error(f"Error during audio processing for {original_name} (path: {audio_path}): {str(e)}", exc_info=True)
+        logger.error(f"Error during chunked audio processing for {original_name} (path: {audio_path}): {str(e)}", exc_info=True)
         # Re-raise a more specific error or a generic one
-        raise RuntimeError(f"Failed to process audio to transcript: {e}") from e
+        raise RuntimeError(f"Failed to process audio to transcript using chunking: {e}") from e
+    finally:
+        # Ensure all temporary chunk files are cleaned up if any were left due to errors before individual cleanup
+        logger.debug(f"Final cleanup of any remaining chunk files for {original_name}")
+        for chunk_path, _ in chunk_files_with_starts:
+             clean_temp_file(chunk_path) # Redundant if successful, but good for error cases
 
 def extract_audio_from_video(video_path: str) -> str:
     """Extract audio from video file and return audio file path"""
