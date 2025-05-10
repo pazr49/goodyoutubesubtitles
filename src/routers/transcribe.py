@@ -4,8 +4,11 @@ import shutil
 import logging
 from pathlib import Path # Import Path
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.responses import FileResponse # Import FileResponse
+from sse_starlette.sse import EventSourceResponse
+import asyncio, json
+from typing import Optional, Dict, Any
 
 # Import config, models, dependencies, processing, utils
 from ..config import Config, YouTube, PytubeFixError # Go up one level for imports
@@ -16,6 +19,10 @@ from ..utils import clean_temp_file
 
 logger = logging.getLogger(__name__)
 router = APIRouter() # Create a router instance
+
+# Add in-memory task progress store
+# Keyed by task_id, each value is a dict with status, stage, message, and optional filename or error
+task_progress_store: Dict[str, Dict[str, Any]] = {}
 
 # --- API Endpoints using the router ---
 @router.get("/ping")
@@ -32,183 +39,86 @@ async def root():
         "status": "online"
     }
 
-@router.post("/transcribe-video", response_model=TranscriptionResponse)
+@router.post("/transcribe-video")
 async def transcribe_video(
+    background_tasks: BackgroundTasks,
     video_file: UploadFile = File(...),
-    client = Depends(get_elevenlabs_client) # Inject dependency
+    client = Depends(get_elevenlabs_client)
 ):
-    """
-    Generate subtitles from uploaded video file.
-    
-    Steps:
-    1. Validate input file type.
-    2. Save uploaded video temporarily.
-    3. Extract audio from video.
-    4. Process audio using transcription service.
-    5. Return path to the generated transcript file.
-    6. Clean up temporary files.
-    """
+    """Enqueue video transcription and return a task_id for progress streaming."""
     # Validate file type
-    file_extension = os.path.splitext(video_file.filename)[1].lower()
-    if file_extension not in Config.ALLOWED_VIDEO_EXTENSIONS:
-        logger.warning(f"Invalid video file type uploaded: {file_extension}")
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Invalid file type '{file_extension}'. Allowed: {', '.join(Config.ALLOWED_VIDEO_EXTENSIONS)}"
-        )
-    
-    # Prepare temporary file paths
-    temp_video_path = os.path.join(Config.TEMP_DIR, f"{uuid.uuid4()}{file_extension}")
-    temp_audio_path = None
-    
-    try:
-        # 1. Save Uploaded Video
-        logger.info(f"Saving uploaded video {video_file.filename} to {temp_video_path}")
-        with open(temp_video_path, "wb") as buffer:
-            shutil.copyfileobj(video_file.file, buffer)
-        logger.info("Video saved successfully.")
-        
-        # 2. Extract audio
-        temp_audio_path = extract_audio_from_video(temp_video_path)
-        
-        # 3. Process audio to transcript
-        transcript_file_path = process_audio_to_transcript(
-            temp_audio_path,
-            client,
-            video_file.filename
-        )
-        
-        logger.info(f"Successfully processed video: {video_file.filename}")
-        return {
-            "message": "Transcription successful",
-            "transcript_file": os.path.basename(transcript_file_path)
-        }
-        
-    except Exception as e:
-        # Log error with file info
-        error_msg = str(e)
-        logger.error(f"Error processing video '{video_file.filename}': {error_msg}", exc_info=True)
-        
-        # Re-raise HTTP exceptions, wrap others in 500
-        if isinstance(e, HTTPException):
-            raise
-        elif isinstance(e, (ValueError, IOError, RuntimeError)): # More specific handling
-             raise HTTPException(status_code=500, detail=f"Processing error: {error_msg}")
-        else:
-            raise HTTPException(status_code=500, detail="An unexpected error occurred during video processing.")
-        
-    finally:
-        # 4. Cleanup Temporary Files
-        logger.debug(f"Cleaning up temporary files for video: {video_file.filename}")
-        await video_file.close()
-        clean_temp_file(temp_video_path)
-        clean_temp_file(temp_audio_path)
+    file_ext = os.path.splitext(video_file.filename)[1].lower()
+    if file_ext not in Config.ALLOWED_VIDEO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Invalid file type '{file_ext}'. Allowed: {', '.join(Config.ALLOWED_VIDEO_EXTENSIONS)}")
+    # Save upload
+    temp_video_path = os.path.join(Config.TEMP_DIR, f"{uuid.uuid4()}{file_ext}")
+    with open(temp_video_path, "wb") as buf:
+        shutil.copyfileobj(video_file.file, buf)
+    await video_file.close()
+    # Prepare task
+    task_id = str(uuid.uuid4())
+    task_progress_store[task_id] = {"status": "queued", "stage": "uploaded", "message": "Video uploaded, ready to start transcription."}
+    # Schedule background task
+    background_tasks.add_task(
+        run_transcription_task,
+        task_id,
+        task_progress_store,
+        video_file_path=temp_video_path,
+        original_video_filename=video_file.filename,
+        youtube_url=None,
+        client=client
+    )
+    return {"task_id": task_id}
 
-@router.post("/transcribe-youtube", response_model=TranscriptionResponse)
+@router.post("/transcribe-youtube")
 async def transcribe_youtube(
     request: YouTubeRequest,
-    client = Depends(get_elevenlabs_client) # Inject dependency
+    background_tasks: BackgroundTasks,
+    client = Depends(get_elevenlabs_client)
 ):
-    """
-    Generate subtitles from YouTube URL.
-    
-    Steps:
-    1. Validate YouTube library availability.
-    2. Download audio from YouTube URL.
-    3. Process downloaded audio using transcription service.
-    4. Return path to the generated transcript file.
-    5. Clean up temporary audio file.
-    """
-    # 1. Validate YouTube library
+    # Validate youtube dependency
     if not YouTube or not PytubeFixError:
-        logger.error("YouTube processing dependency (pytubefix) not available.")
-        raise HTTPException(
-            status_code=501, # Not Implemented
-            detail="YouTube processing dependency (pytubefix) not installed or available."
-        )
-        
+        raise HTTPException(status_code=501, detail="YouTube processing dependency not available.")
     url = str(request.url)
-    temp_audio_path = None
-    video_title = "youtube_video"  # Default fallback title
-    
-    logger.info(f"--- Entering transcribe_youtube for URL: {url} ---")
-    try:
-        # 2. Download Audio from YouTube
-        logger.info("Attempting to initialize YouTube object...")
-        yt = YouTube(url)
-        logger.info("YouTube object initialized.")
-        
-        if hasattr(yt, 'title') and yt.title:
-            video_title = yt.title
-            logger.info(f"Processing YouTube video: '{video_title}'")
-        else:
-            logger.info("Processing YouTube video (title not found). Using default.")
-        
-        logger.info("Filtering for audio streams...")
-        stream = yt.streams.filter(
-            only_audio=True, 
-            file_extension=Config.PREFERRED_AUDIO_FORMAT
-        ).order_by('abr').desc().first()
-        
-        if not stream:
-            logger.info(f"Preferred format '{Config.PREFERRED_AUDIO_FORMAT}' not found, trying get_audio_only()...")
-            stream = yt.streams.get_audio_only()
-            
-        if not stream:
-            logger.warning(f"No suitable audio stream found for URL: {url}")
-            raise HTTPException(
-                status_code=404, 
-                detail="No suitable audio stream found for this YouTube video"
-            )
-        else:
-            logger.info(f"Selected audio stream: {stream}")
-            
-        logger.info("Preparing to download audio...")
-        audio_extension = f".{stream.subtype}"
-        temp_audio_filename = f"{uuid.uuid4()}_youtube_audio{audio_extension}"
-        temp_audio_path = os.path.join(Config.TEMP_DIR, temp_audio_filename)
-        
-        logger.info(f"Attempting download to: {temp_audio_path}")
-        stream.download(output_path=Config.TEMP_DIR, filename=temp_audio_filename)
-        logger.info(f"YouTube audio download complete: {temp_audio_path}")
-        
-        # 3. Process Audio
-        logger.info(f"Calling process_audio_to_transcript for {temp_audio_path}...")
-        transcript_file_path = process_audio_to_transcript(
-            temp_audio_path,
-            client,
-            video_title # Use fetched title
-        )
-        logger.info(f"process_audio_to_transcript completed. Result path: {transcript_file_path}")
-        
-        # 4. Return Result
-        logger.info(f"Successfully processed YouTube URL: {url}")
-        logger.info("--- Exiting transcribe_youtube successfully ---")
-        return {
-            "message": "Transcription successful",
-            "transcript_file": os.path.basename(transcript_file_path)
-        }
-        
-    except PytubeFixError as e:
-        logger.error(f"PytubeFixError processing {url}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=400, detail=f"Error processing YouTube URL (pytube): {str(e)}")
-        
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Generic error processing YouTube URL {url}: {error_msg}", exc_info=True)
-        
-        # Re-raise HTTP exceptions, wrap others
-        if isinstance(e, HTTPException):
-            raise
-        elif isinstance(e, (ValueError, IOError, RuntimeError)): # Handle known processing errors
-             raise HTTPException(status_code=500, detail=f"Processing error: {error_msg}")
-        else:
-            raise HTTPException(status_code=500, detail="An unexpected error occurred during YouTube processing.")
-        
-    finally:
-        # 5. Cleanup Temporary File
-        logger.info(f"--- Cleaning up transcribe_youtube for URL: {url} ---")
-        clean_temp_file(temp_audio_path)
+    # Prepare task
+    task_id = str(uuid.uuid4())
+    task_progress_store[task_id] = {"status": "queued", "stage": "initialized", "message": "YouTube transcription queued."}
+    # Schedule background task
+    background_tasks.add_task(
+        run_transcription_task,
+        task_id,
+        task_progress_store,
+        video_file_path=None,
+        original_video_filename=None,
+        youtube_url=url,
+        client=client
+    )
+    return {"task_id": task_id}
+
+@router.get("/progress/{task_id}")
+async def stream_progress(task_id: str, request: Request):
+    """Server-Sent Events endpoint to stream task progress updates."""
+    async def event_generator():
+        last_data = None
+        while True:
+            # Check client disconnect
+            if await request.is_disconnected():
+                break
+            progress = task_progress_store.get(task_id)
+            if progress is None:
+                # If no such task, notify once and end
+                payload = {"status": "not_found", "message": "Task ID not found."}
+                yield {"data": json.dumps(payload)}
+                break
+            data = json.dumps(progress)
+            if data != last_data:
+                yield {"data": data}
+                last_data = data
+            # Stop streaming on completion or error
+            if progress.get("status") in ("complete", "error", "cancelled"):
+                break
+            await asyncio.sleep(1)
+    return EventSourceResponse(event_generator())
 
 # --- NEW DOWNLOAD ENDPOINT --- 
 @router.get("/download/{filename}")
@@ -252,3 +162,49 @@ async def download_transcript(filename: str):
     except Exception as e:
         logger.error(f"Error during file download for {filename}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error while retrieving file.") 
+
+# --- Background task handler ---
+async def run_transcription_task(
+    task_id: str,
+    progress_store: Dict[str, Dict[str, Any]],
+    video_file_path: Optional[str],
+    original_video_filename: Optional[str],
+    youtube_url: Optional[str],
+    client
+):
+    """Background transcription task, updates progress_store as it goes."""
+    try:
+        # Step 1: Audio preparation
+        if youtube_url:
+            progress_store[task_id] = {"status": "processing", "stage": "download", "message": "Downloading audio from YouTube..."}
+            yt = YouTube(youtube_url)
+            title = yt.title or "youtube_video"
+            stream = yt.streams.filter(only_audio=True, file_extension=Config.PREFERRED_AUDIO_FORMAT).order_by('abr').desc().first() or yt.streams.get_audio_only()
+            if not stream:
+                raise RuntimeError("No suitable audio stream found.")
+            audio_ext = f".{stream.subtype}"
+            temp_audio_name = f"{uuid.uuid4()}_youtube{audio_ext}"
+            temp_audio_path = os.path.join(Config.TEMP_DIR, temp_audio_name)
+            stream.download(output_path=Config.TEMP_DIR, filename=temp_audio_name)
+            progress_store[task_id] = {"status": "processing", "stage": "downloaded", "message": "YouTube audio downloaded."}
+            audio_path = temp_audio_path
+            original_name = title
+        else:
+            progress_store[task_id] = {"status": "processing", "stage": "extract", "message": "Extracting audio from uploaded video..."}
+            audio_path = extract_audio_from_video(video_file_path)
+            progress_store[task_id] = {"status": "processing", "stage": "extracted", "message": "Audio extraction complete."}
+            original_name = original_video_filename
+        # Step 2: Transcription
+        progress_store[task_id] = {"status": "processing", "stage": "transcribing", "message": "Transcribing audio..."}
+        transcript_path = process_audio_to_transcript(audio_path, client, original_name)
+        # Step 3: Complete
+        progress_store[task_id] = {"status": "complete", "stage": "finished", "message": "Transcription complete.", "filename": os.path.basename(transcript_path)}
+    except Exception as e:
+        logger.error(f"Task {task_id} failed: {e}", exc_info=True)
+        progress_store[task_id] = {"status": "error", "stage": "failed", "message": str(e)}
+    finally:
+        # Cleanup temp files
+        if youtube_url and 'temp_audio_path' in locals():
+            clean_temp_file(temp_audio_path)
+        if video_file_path:
+            clean_temp_file(video_file_path) 
