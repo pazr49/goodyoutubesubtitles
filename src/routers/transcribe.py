@@ -77,17 +77,21 @@ async def transcribe_video(
         raise HTTPException(status_code=400, detail=f"Invalid file type '{file_ext}'. Allowed: {', '.join(Config.ALLOWED_VIDEO_EXTENSIONS)}")
     # Save upload
     temp_video_path = os.path.join(Config.TEMP_DIR, f"{uuid.uuid4()}{file_ext}")
-    with open(temp_video_path, "wb") as buf:
-        shutil.copyfileobj(video_file.file, buf)
-    await video_file.close()
+    try:
+        with open(temp_video_path, "wb") as buf:
+            shutil.copyfileobj(video_file.file, buf)
+    finally:
+        await video_file.close()
     # Prepare task
     task_id = str(uuid.uuid4())
-    task_progress_store[task_id] = {"status": "queued", "stage": "uploaded", "message": "Video uploaded, ready to start transcription."}
+    await _update_task_progress_and_notify(
+        task_id,
+        {"status": "queued", "stage": "uploaded", "message": "Video uploaded, ready to start transcription."}
+    )
     # Schedule background task
     background_tasks.add_task(
         run_transcription_task,
         task_id,
-        task_progress_store,
         video_file_path=temp_video_path,
         original_video_filename=video_file.filename,
         youtube_url=None,
@@ -129,7 +133,7 @@ async def stream_progress(task_id: str, request: Request):
 
     async def event_generator():
         my_queue = asyncio.Queue()
-        initial_progress_sent = False # To track if we've sent the very first state
+        last_sent_progress_content: Optional[Dict[str, Any]] = None
 
         try:
             # Register the queue for this client
@@ -139,19 +143,19 @@ async def stream_progress(task_id: str, request: Request):
                 task_event_queues[task_id].append(my_queue)
             logger.info(f"SSE client connected for task {task_id}. Registered queue.")
 
-            # Immediately send the current progress, if any, as the very first message.
-            # This ensures a client connecting mid-task gets the current state.
-            current_progress = task_progress_store.get(task_id)
-            if current_progress:
-                yield {"data": json.dumps(current_progress)}
-                logger.debug(f"Sent initial progress for task {task_id} to new SSE client: {current_progress}")
-                initial_progress_sent = True
-                # If task is already in a terminal state, we might not need to listen further.
-                if current_progress.get("status") in ("complete", "error", "cancelled", "not_found"):
-                    logger.info(f"Task {task_id} already in terminal state ({current_progress.get('status')}). Closing SSE stream early for this client.")
-                    return # Exit generator for this client
+            current_snapshot_progress = task_progress_store.get(task_id)
 
-            last_data_sent = json.dumps(current_progress) if current_progress else None
+            if current_snapshot_progress:
+                yield {"data": json.dumps(current_snapshot_progress)}
+                last_sent_progress_content = current_snapshot_progress
+                logger.debug(f"Sent initial snapshot progress for task {task_id}: {current_snapshot_progress}")
+                # Do not return early if terminal, queue might have earlier states.
+            elif not current_snapshot_progress:
+                 # If task isn't even in the store, it's likely a bogus task_id from client
+                 not_found_payload = {"status": "not_found", "message": "Task ID not found in progress store."}
+                 yield {"data": json.dumps(not_found_payload)}
+                 logger.warning(f"Task ID {task_id} not found in task_progress_store. Sent not_found and closing SSE for this client.")
+                 return
 
             while True:
                 if await request.is_disconnected():
@@ -161,7 +165,7 @@ async def stream_progress(task_id: str, request: Request):
                 try:
                     # Wait for a new progress update from the queue
                     # Add a timeout to periodically check for client disconnect
-                    progress = await asyncio.wait_for(my_queue.get(), timeout=30.0) 
+                    progress_from_queue = await asyncio.wait_for(my_queue.get(), timeout=30.0) 
                 except asyncio.TimeoutError:
                     # No new progress within timeout, just loop to check disconnect status
                     logger.debug(f"SSE for task {task_id} timed out waiting for queue, checking disconnect.")
@@ -169,20 +173,15 @@ async def stream_progress(task_id: str, request: Request):
                 
                 my_queue.task_done() # Acknowledge message processed from queue
 
-                data_to_send = json.dumps(progress)
-
-                # Only send if data has actually changed since last send for this specific client
-                # Or if this is the very first message and it wasn't sent above (e.g. task started after connect)
-                if data_to_send != last_data_sent or not initial_progress_sent:
-                    yield {"data": data_to_send}
-                    last_data_sent = data_to_send
-                    initial_progress_sent = True # Mark that we've sent at least one progress update
-                    logger.debug(f"Sent progress update for task {task_id} via SSE: {progress}")
+                if progress_from_queue != last_sent_progress_content:
+                    yield {"data": json.dumps(progress_from_queue)}
+                    last_sent_progress_content = progress_from_queue
+                    logger.debug(f"Sent progress update from queue for task {task_id}: {progress_from_queue}")
                 else:
-                    logger.debug(f"Skipping send for task {task_id} as progress data is same as last sent: {progress}")
+                    logger.debug(f"Skipping send from queue for task {task_id} as data is same as last sent: {progress_from_queue}")
 
-                if progress.get("status") in ("complete", "error", "cancelled", "not_found"):
-                    logger.info(f"Task {task_id} reached terminal state ({progress.get('status')}). Closing SSE stream.")
+                if progress_from_queue.get("status") in ("complete", "error", "cancelled", "not_found"):
+                    logger.info(f"Task {task_id} reached terminal state ({progress_from_queue.get('status')}) via queue. Closing SSE stream.")
                     break
         
         except Exception as e:
