@@ -2,6 +2,7 @@ import os
 import uuid
 import logging
 from typing import Optional
+import time
 
 from .config import Config # Relative import
 
@@ -82,4 +83,39 @@ def clean_temp_file(file_path: str, task_id_for_log: Optional[str] = None):
     except OSError as e:
         logger.error(f"{log_prefix}Error removing temporary file {file_path}: {e}", exc_info=True)
     except Exception as e:
-        logger.error(f"{log_prefix}An unexpected error occurred while cleaning temp file {file_path}: {e}", exc_info=True) 
+        logger.error(f"{log_prefix}An unexpected error occurred while cleaning temp file {file_path}: {e}", exc_info=True)
+
+def cleanup_old_sbv_files(max_age_seconds: int = 300): # Default 5 minutes
+    """
+    Scans the TEMP_DIR for .sbv files and deletes those older than max_age_seconds.
+    """
+    logger.info(f"Running cleanup task for .sbv files older than {max_age_seconds} seconds.")
+    now = time.time()
+    files_deleted_count = 0
+    files_scanned_count = 0
+
+    try:
+        for filename in os.listdir(Config.TEMP_DIR):
+            if filename.endswith(".sbv"):
+                files_scanned_count += 1
+                file_path = os.path.join(Config.TEMP_DIR, filename)
+                try:
+                    file_mod_time = os.path.getmtime(file_path)
+                    if (now - file_mod_time) > max_age_seconds:
+                        os.remove(file_path)
+                        logger.info(f"Deleted old .sbv file: {file_path}")
+                        files_deleted_count += 1
+                except FileNotFoundError:
+                    logger.warning(f"File not found during cleanup (possibly deleted by another process): {file_path}")
+                except OSError as e:
+                    logger.error(f"Error deleting file {file_path} during cleanup: {e}")
+        
+        if files_scanned_count > 0:
+            logger.info(f"Cleanup task finished. Scanned: {files_scanned_count} .sbv files. Deleted: {files_deleted_count}.")
+        else:
+            logger.info("Cleanup task finished. No .sbv files found to scan.")
+            
+    except FileNotFoundError:
+        logger.warning(f"Temporary directory {Config.TEMP_DIR} not found during cleanup scan. It might be created later.")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during .sbv cleanup: {e}", exc_info=True) 
