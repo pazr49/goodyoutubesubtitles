@@ -18,19 +18,19 @@ logger = logging.getLogger(__name__)
 CHUNK_LENGTH_S = 5 * 60  # 5 minutes in seconds
 OVERLAP_S = 5          # 5 seconds overlap
 
-def _split_audio_into_chunks(audio_path: str, original_name: str) -> List[tuple[str, float]]:
+def _split_audio_into_chunks(task_id_for_log: str, audio_path: str, original_name: str) -> List[tuple[str, float]]:
     """
     Splits an audio file into chunks with overlap.
     Returns a list of tuples: (chunk_file_path, chunk_start_time_seconds).
     """
-    logger.info(f"Splitting audio file: {audio_path} into {CHUNK_LENGTH_S}s chunks with {OVERLAP_S}s overlap.")
+    logger.info(f"[{task_id_for_log}] Splitting audio file: {audio_path} into {CHUNK_LENGTH_S}s chunks with {OVERLAP_S}s overlap.")
     chunk_paths_with_starts = []
     
     try:
         audio = AudioSegment.from_file(audio_path)
-        logger.info(f"Audio duration: {len(audio) / 1000.0}s")
+        logger.info(f"[{task_id_for_log}] Audio duration: {len(audio) / 1000.0}s")
     except Exception as e:
-        logger.error(f"Failed to load audio file {audio_path} with pydub: {e}", exc_info=True)
+        logger.error(f"[{task_id_for_log}] Failed to load audio file {audio_path} with pydub: {e}", exc_info=True)
         raise ValueError(f"Pydub failed to load audio: {e}")
 
     chunk_length_ms = CHUNK_LENGTH_S * 1000
@@ -45,7 +45,7 @@ def _split_audio_into_chunks(audio_path: str, original_name: str) -> List[tuple[
             chunk_filename = f"{os.path.splitext(original_name)[0]}_chunk_0_{uuid.uuid4().hex[:8]}.{audio.format or 'mp3'}"
             chunk_path = os.path.join(Config.TEMP_DIR, chunk_filename)
             audio.export(chunk_path, format=audio.format or 'mp3')
-            logger.info(f"Audio shorter than a chunk or invalid step, processing as one: {chunk_path}")
+            logger.info(f"[{task_id_for_log}] Audio shorter than a chunk or invalid step, processing as one: {chunk_path}")
             return [(chunk_path, 0.0)]
         else: # If step is invalid but audio is longer, adjust step to avoid issues.
             step_ms = chunk_length_ms # Effectively no overlap if step_ms was problematic
@@ -63,7 +63,7 @@ def _split_audio_into_chunks(audio_path: str, original_name: str) -> List[tuple[
         chunk = audio[chunk_start_ms:actual_chunk_end_ms]
         
         if len(chunk) == 0: # Should not happen if logic is correct
-            logger.warning(f"Empty chunk generated at index {idx}, start_ms {chunk_start_ms}. Skipping.")
+            logger.warning(f"[{task_id_for_log}] Empty chunk generated at index {idx}, start_ms {chunk_start_ms}. Skipping.")
             current_pos_ms += step_ms
             continue
 
@@ -78,11 +78,11 @@ def _split_audio_into_chunks(audio_path: str, original_name: str) -> List[tuple[
         chunk_path = os.path.join(Config.TEMP_DIR, chunk_filename)
         
         try:
-            logger.info(f"Exporting chunk {idx}: {chunk_path} (covers {chunk_start_ms/1000.0}s to {actual_chunk_end_ms/1000.0}s of original)")
+            logger.info(f"[{task_id_for_log}] Exporting chunk {idx}: {chunk_path} (covers {chunk_start_ms/1000.0}s to {actual_chunk_end_ms/1000.0}s of original)")
             chunk.export(chunk_path, format=file_extension)
             chunk_paths_with_starts.append((chunk_path, chunk_start_ms / 1000.0))
         except Exception as e:
-            logger.error(f"Failed to export audio chunk {chunk_path}: {e}", exc_info=True)
+            logger.error(f"[{task_id_for_log}] Failed to export audio chunk {chunk_path}: {e}", exc_info=True)
             # Decide if we should skip this chunk or raise an error
             # For now, skip and log
             
@@ -103,27 +103,27 @@ def _split_audio_into_chunks(audio_path: str, original_name: str) -> List[tuple[
     if not chunk_paths_with_starts and len(audio) > 0:
         # If splitting resulted in no chunks (e.g., very short audio not caught by initial check)
         # Treat the whole audio as a single chunk.
-        logger.warning(f"Splitting resulted in no chunks for {audio_path}. Treating as a single chunk.")
+        logger.warning(f"[{task_id_for_log}] Splitting resulted in no chunks for {audio_path}. Treating as a single chunk.")
         single_chunk_filename = f"{os.path.splitext(original_name)[0]}_single_chunk_{uuid.uuid4().hex[:8]}.{getattr(audio, 'format', 'mp3')}"
         single_chunk_path = os.path.join(Config.TEMP_DIR, single_chunk_filename)
         audio.export(single_chunk_path, format=getattr(audio, 'format', 'mp3'))
         return [(single_chunk_path, 0.0)]
         
-    logger.info(f"Successfully split audio into {len(chunk_paths_with_starts)} chunks.")
+    logger.info(f"[{task_id_for_log}] Successfully split audio into {len(chunk_paths_with_starts)} chunks.")
     return chunk_paths_with_starts
 
-def _stitch_transcriptions(chunk_word_data_list: List[tuple[List[Any], float]], overlap_s: float) -> List[Any]:
+def _stitch_transcriptions(task_id_for_log: str, chunk_word_data_list: List[tuple[List[Any], float]], overlap_s: float) -> List[Any]:
     """
     Stitches word data from multiple chunks, handling overlaps.
     chunk_word_data_list: List of (list of word objects, chunk_start_time_in_original_audio_seconds)
     overlap_s: The duration of the overlap in seconds.
     """
-    logger.info(f"Stitching {len(chunk_word_data_list)} transcript chunks with {overlap_s}s overlap.")
+    logger.info(f"[{task_id_for_log}] Stitching {len(chunk_word_data_list)} transcript chunks with {overlap_s}s overlap.")
     stitched_words = []
     last_global_end_time = 0.0  # Tracks the end time of the last word added from the *previous* chunk
 
     for i, (words_from_chunk, chunk_original_start_s) in enumerate(chunk_word_data_list):
-        logger.debug(f"Processing chunk {i} which originally started at {chunk_original_start_s}s.")
+        logger.debug(f"[{task_id_for_log}] Processing chunk {i} which originally started at {chunk_original_start_s}s.")
         
         current_chunk_processed_words = []
         for word_info in words_from_chunk:
@@ -154,7 +154,7 @@ def _stitch_transcriptions(chunk_word_data_list: List[tuple[List[Any], float]], 
             stitched_words.extend(current_chunk_processed_words)
             if stitched_words:
                 last_global_end_time = stitched_words[-1]['end']
-            logger.debug(f"Added {len(current_chunk_processed_words)} words from the first chunk. Last end time: {last_global_end_time}")
+            logger.debug(f"[{task_id_for_log}] Added {len(current_chunk_processed_words)} words from the first chunk. Last end time: {last_global_end_time}")
         else:
             # For subsequent chunks, only add words that start after the last added word from the previous chunk,
             # considering the overlap.
@@ -188,9 +188,9 @@ def _stitch_transcriptions(chunk_word_data_list: List[tuple[List[Any], float]], 
             
             if stitched_words: # Update last_global_end_time with the newly added words
                 last_global_end_time = stitched_words[-1]['end']
-            logger.debug(f"Added {added_count} words from chunk {i}. Last end time now: {last_global_end_time}")
+            logger.debug(f"[{task_id_for_log}] Added {added_count} words from chunk {i}. Last end time now: {last_global_end_time}")
 
-    logger.info(f"Stitching complete. Total words: {len(stitched_words)}.")
+    logger.info(f"[{task_id_for_log}] Stitching complete. Total words: {len(stitched_words)}.")
     # The 'words' objects from ElevenLabs might not be simple dicts.
     # We need to ensure create_transcript_format can handle what we pass it.
     # Let's convert our list of dicts back to a list of objects similar to what ElevenLabs returns, if necessary.
@@ -307,15 +307,16 @@ def create_transcript_format(
     return result
 
 def process_audio_to_transcript(
+    task_id_for_log: str,
     audio_path: str, 
     client: ElevenLabs, # Type hint added
     original_name: str
 ) -> str:
     """Process an audio file to generate transcript using chunking"""
-    logger.info(f"Processing audio file via chunking: {audio_path} (original: {original_name})")
+    logger.info(f"[{task_id_for_log}] Processing audio file via chunking: {audio_path} (original: {original_name})")
     
     if not client:
-        logger.error("process_audio_to_transcript called with uninitialized ElevenLabs client.")
+        logger.error(f"[{task_id_for_log}] process_audio_to_transcript called with uninitialized ElevenLabs client.")
         raise ValueError("ElevenLabs client is not available")
 
     chunk_files_with_starts = []
@@ -323,70 +324,62 @@ def process_audio_to_transcript(
 
     try:
         # 1. Split audio into chunks
-        logger.info("Step 1: Splitting audio into chunks...")
-        chunk_files_with_starts = _split_audio_into_chunks(audio_path, original_name)
+        logger.info(f"[{task_id_for_log}] Step 1: Splitting audio into chunks...")
+        chunk_files_with_starts = _split_audio_into_chunks(task_id_for_log, audio_path, original_name)
         
         if not chunk_files_with_starts:
-            logger.warning(f"Audio splitting yielded no chunks for {original_name}. Aborting transcription.")
+            logger.warning(f"[{task_id_for_log}] Audio splitting yielded no chunks for {original_name}. Aborting transcription.")
             raise ValueError("Audio splitting failed to produce any chunks.")
 
         # 2. Process each chunk
-        logger.info(f"Step 2: Processing {len(chunk_files_with_starts)} audio chunks through ElevenLabs...")
+        logger.info(f"[{task_id_for_log}] Step 2: Processing {len(chunk_files_with_starts)} audio chunks through ElevenLabs...")
         for i, (chunk_path, chunk_start_s) in enumerate(chunk_files_with_starts):
-            logger.info(f"Processing chunk {i+1}/{len(chunk_files_with_starts)}: {chunk_path} (starts at {chunk_start_s}s)")
+            logger.info(f"[{task_id_for_log}] Processing chunk {i+1}/{len(chunk_files_with_starts)}: {chunk_path} (starts at {chunk_start_s}s)")
             try:
                 with open(chunk_path, 'rb') as audio_chunk_file:
                     response = client.speech_to_text.convert(
                         file=audio_chunk_file,
                         model_id=Config.ELEVENLABS_MODEL_ID
-                        # Add other parameters like language if needed
                     )
                 
                 if hasattr(response, 'words') and response.words:
-                    logger.info(f"Received {len(response.words)} words from chunk {i+1}.")
+                    logger.info(f"[{task_id_for_log}] Received {len(response.words)} words from chunk {i+1}.")
                     all_chunk_word_data.append((response.words, chunk_start_s))
                 else:
-                    logger.warning(f"Empty or invalid transcription response for chunk {chunk_path}. Response: {response}")
+                    logger.warning(f"[{task_id_for_log}] Empty or invalid transcription response for chunk {chunk_path}. Response: {response}")
             except Exception as e:
-                logger.error(f"Error transcribing audio chunk {chunk_path}: {e}", exc_info=True)
-                # Decide: skip chunk, or fail all? For now, continue if some chunks fail.
-                # This could lead to gaps in transcription.
-                # Consider adding a placeholder or specific error handling.
+                logger.error(f"[{task_id_for_log}] Error transcribing audio chunk {chunk_path}: {e}", exc_info=True)
             finally:
-                clean_temp_file(chunk_path) # Clean up individual chunk file
+                clean_temp_file(chunk_path)
 
         if not all_chunk_word_data:
-            logger.error(f"No words returned from any audio chunks for {original_name}.")
+            logger.error(f"[{task_id_for_log}] No words returned from any audio chunks for {original_name}.")
             raise ValueError("Transcription service returned no words from any chunks.")
 
         # 3. Stitch transcriptions
-        logger.info("Step 3: Stitching transcriptions from chunks...")
-        stitched_word_objects = _stitch_transcriptions(all_chunk_word_data, OVERLAP_S)
+        logger.info(f"[{task_id_for_log}] Step 3: Stitching transcriptions from chunks...")
+        stitched_word_objects = _stitch_transcriptions(task_id_for_log, all_chunk_word_data, OVERLAP_S)
         
         if not stitched_word_objects:
-            logger.warning(f"Stitching resulted in no words for {original_name}.")
-            # This could be an empty transcript if audio was silent, or an error.
-            # For now, proceed to format, which will yield an empty string.
+            logger.warning(f"[{task_id_for_log}] Stitching resulted in no words for {original_name}.")
             
         # 4. Format transcript
-        logger.info("Step 4: Formatting final stitched transcript...")
+        logger.info(f"[{task_id_for_log}] Step 4: Formatting final stitched transcript...")
         transcript_text = create_transcript_format(stitched_word_objects) # Pass the stitched list of PseudoWord objects
         
         # 5. Save to file
-        logger.info("Step 5: Saving final transcript to file...")
+        logger.info(f"[{task_id_for_log}] Step 5: Saving final transcript to file...")
         transcript_path = save_transcript_to_file(transcript_text, original_name)
-        logger.info(f"Successfully processed and chunked audio: {original_name}. Transcript at: {transcript_path}")
+        logger.info(f"[{task_id_for_log}] Successfully processed and chunked audio: {original_name}. Transcript at: {transcript_path}")
         return transcript_path
         
     except Exception as e:
-        logger.error(f"Error during chunked audio processing for {original_name} (path: {audio_path}): {str(e)}", exc_info=True)
-        # Re-raise a more specific error or a generic one
+        logger.error(f"[{task_id_for_log}] Error during chunked audio processing for {original_name} (path: {audio_path}): {str(e)}", exc_info=True)
         raise RuntimeError(f"Failed to process audio to transcript using chunking: {e}") from e
     finally:
-        # Ensure all temporary chunk files are cleaned up if any were left due to errors before individual cleanup
-        logger.debug(f"Final cleanup of any remaining chunk files for {original_name}")
+        logger.debug(f"[{task_id_for_log}] Final cleanup of any remaining chunk files for {original_name}")
         for chunk_path, _ in chunk_files_with_starts:
-             clean_temp_file(chunk_path) # Redundant if successful, but good for error cases
+             clean_temp_file(chunk_path)
 
 def extract_audio_from_video(video_path: str) -> str:
     """Extract audio from video file and return audio file path"""

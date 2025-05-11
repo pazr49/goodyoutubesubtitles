@@ -3,13 +3,14 @@ import uuid
 import shutil
 import logging
 from pathlib import Path # Import Path
-import asyncio # Added
-import json # Added
+import time # Add for timestamps
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.responses import FileResponse # Import FileResponse
 from sse_starlette.sse import EventSourceResponse
-from typing import Optional, Dict, Any, List # Added List
+import asyncio, json
+from typing import Optional, Dict, Any
+import uuid as _uuid  # for thread helper
 
 # Import config, models, dependencies, processing, utils
 from ..config import Config, YouTube, PytubeFixError # Go up one level for imports
@@ -25,29 +26,50 @@ router = APIRouter() # Create a router instance
 # Keyed by task_id, each value is a dict with status, stage, message, and optional filename or error
 task_progress_store: Dict[str, Dict[str, Any]] = {}
 
-# New: Stores a list of asyncio.Queue for each task_id to notify listeners
-# Each queue in the list corresponds to one active SSE connection for that task_id.
-task_event_queues: Dict[str, List[asyncio.Queue]] = {}
-task_event_queues_lock = asyncio.Lock() # To protect concurrent access to task_event_queues
+# Queue store for SSE subscribers, keyed by task_id
+event_queue_store: Dict[str, asyncio.Queue] = {}
 
-async def _update_task_progress_and_notify(task_id: str, progress_data: Dict[str, Any]):
-    """
-    Updates the task_progress_store and notifies all listening SSE generators.
-    """
-    logger.debug(f"Updating progress for task {task_id}: {progress_data}")
-    task_progress_store[task_id] = progress_data
+# Helper to update progress_store and notify SSE clients
+def _update_progress(task_id: str, progress: Dict[str, Any]):
+    logger.info(f"[{task_id}] UPDATING PROGRESS: {progress['status']} - {progress['stage']}")
+    task_progress_store[task_id] = progress
+    queue = event_queue_store.get(task_id)
+    if queue:
+        queue.put_nowait(progress.copy())
+        logger.info(f"[{task_id}] QUEUED UPDATE: {progress['status']} - {progress['stage']}")
+    else:
+        logger.warning(f"[{task_id}] NO QUEUE FOUND when trying to update progress: {progress['status']} - {progress['stage']}")
 
-    async with task_event_queues_lock:
-        queues_for_task = task_event_queues.get(task_id, [])
-        if not queues_for_task:
-            logger.debug(f"No active SSE listeners for task {task_id} to notify.")
-        else:
-            logger.debug(f"Notifying {len(queues_for_task)} SSE listener(s) for task {task_id}.")
-        for queue in queues_for_task:
-            try:
-                await queue.put(progress_data)
-            except Exception as e:
-                logger.error(f"Error putting progress into queue for task {task_id}: {e}", exc_info=True)
+# Helper to download YouTube audio in a sync thread
+def _download_youtube_sync(task_id_for_log: str, youtube_url: str) -> tuple[str, str]:
+    """Synchronously download YouTube audio and return file path and title."""
+    logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_SYNC: Initializing YouTube object for {youtube_url[:30]}...")
+    yt = YouTube(youtube_url)
+    title = yt.title or "youtube_video"
+    logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_SYNC: Video Title - {title}")
+    
+    logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_SYNC: Selecting audio stream...")
+    stream = yt.streams.filter(
+        only_audio=True,
+        file_extension=Config.PREFERRED_AUDIO_FORMAT
+    ).order_by('abr').desc().first() or yt.streams.get_audio_only()
+    
+    if not stream:
+        logger.error(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_SYNC: No suitable audio stream found.")
+        raise RuntimeError("No suitable audio stream found.")
+        
+    audio_ext = f".{stream.subtype}"
+    # Use a more descriptive temp_audio_name that includes a UUID for uniqueness
+    temp_audio_name = f"{_uuid.uuid4()}_youtube{audio_ext}" 
+    temp_audio_path = os.path.join(Config.TEMP_DIR, temp_audio_name)
+    logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_SYNC: Downloading stream to {temp_audio_path}")
+    
+    download_start_time = time.time()
+    stream.download(output_path=Config.TEMP_DIR, filename=temp_audio_name)
+    download_duration = time.time() - download_start_time
+    logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_SYNC: Download complete in {download_duration:.2f} seconds. Path: {temp_audio_path}")
+    
+    return temp_audio_path, title
 
 # --- API Endpoints using the router ---
 @router.get("/ping")
@@ -77,21 +99,19 @@ async def transcribe_video(
         raise HTTPException(status_code=400, detail=f"Invalid file type '{file_ext}'. Allowed: {', '.join(Config.ALLOWED_VIDEO_EXTENSIONS)}")
     # Save upload
     temp_video_path = os.path.join(Config.TEMP_DIR, f"{uuid.uuid4()}{file_ext}")
-    try:
-        with open(temp_video_path, "wb") as buf:
-            shutil.copyfileobj(video_file.file, buf)
-    finally:
-        await video_file.close()
+    with open(temp_video_path, "wb") as buf:
+        shutil.copyfileobj(video_file.file, buf)
+    await video_file.close()
     # Prepare task
     task_id = str(uuid.uuid4())
-    await _update_task_progress_and_notify(
-        task_id,
-        {"status": "queued", "stage": "uploaded", "message": "Video uploaded, ready to start transcription."}
-    )
+    # Initialize queue and publish initial state
+    event_queue_store[task_id] = asyncio.Queue()
+    _update_progress(task_id, {"status": "queued", "stage": "uploaded", "message": "Video uploaded, ready to start transcription."})
     # Schedule background task
     background_tasks.add_task(
         run_transcription_task,
         task_id,
+        task_progress_store,
         video_file_path=temp_video_path,
         original_video_filename=video_file.filename,
         youtube_url=None,
@@ -109,102 +129,92 @@ async def transcribe_youtube(
     if not YouTube or not PytubeFixError:
         raise HTTPException(status_code=501, detail="YouTube processing dependency not available.")
     url = str(request.url)
+    
+    # Log receipt of request
+    logger.info(f"YOUTUBE REQUEST RECEIVED: {url[:30]}...")
+    
     # Prepare task
     task_id = str(uuid.uuid4())
-    # Initial progress update
-    await _update_task_progress_and_notify(
-        task_id,
-        {"status": "queued", "stage": "initialized", "message": "YouTube transcription queued."}
-    )
-    # Schedule background task
-    background_tasks.add_task(
-        run_transcription_task,
-        task_id,
-        video_file_path=None,
-        original_video_filename=None,
-        youtube_url=url,
-        client=client
-    )
+    logger.info(f"[{task_id}] TASK ID GENERATED")
+    
+    # Initialize queue and publish initial state
+    event_queue_store[task_id] = asyncio.Queue()
+    logger.info(f"[{task_id}] CREATED QUEUE")
+    
+    _update_progress(task_id, {"status": "queued", "stage": "initialized", "message": "YouTube transcription queued."})
+    
+    # Schedule background task but add a small delay to ensure endpoints return first
+    logger.info(f"[{task_id}] SCHEDULING BACKGROUND TASK (with 0.5s delay)")
+    
+    async def delayed_task():
+        logger.info(f"[{task_id}] BACKGROUND TASK DELAY ACTIVE - waiting 0.5s before starting")
+        await asyncio.sleep(0.5)  # Small delay to ensure endpoint returns and SSE can connect
+        logger.info(f"[{task_id}] BACKGROUND TASK STARTING PROCESSING")
+        await run_transcription_task(
+            task_id,
+            task_progress_store,
+            video_file_path=None,
+            original_video_filename=None,
+            youtube_url=url,
+            client=client
+        )
+    
+    background_tasks.add_task(delayed_task)
+    
+    logger.info(f"[{task_id}] RETURNING TASK ID TO CLIENT")
     return {"task_id": task_id}
 
 @router.get("/progress/{task_id}")
 async def stream_progress(task_id: str, request: Request):
     """Server-Sent Events endpoint to stream task progress updates."""
-
+    logger.info(f"[{task_id}] SSE CONNECTION ESTABLISHED")
+    
+    # Ensure a queue exists for this task
+    queue = event_queue_store.setdefault(task_id, asyncio.Queue())
+    logger.info(f"[{task_id}] QUEUE RETRIEVED/CREATED")
+    
+    # Push current state if available
+    if task_progress_store.get(task_id):
+        current_state = task_progress_store[task_id].copy()
+        logger.info(f"[{task_id}] FOUND EXISTING STATE: {current_state['status']} - {current_state['stage']}")
+        await queue.put(current_state)
+        logger.info(f"[{task_id}] QUEUED EXISTING STATE")
+    else:
+        logger.warning(f"[{task_id}] NO EXISTING STATE FOUND for SSE connection")
+    
     async def event_generator():
-        my_queue = asyncio.Queue()
-        last_sent_progress_content: Optional[Dict[str, Any]] = None
-
-        try:
-            # Register the queue for this client
-            async with task_event_queues_lock:
-                if task_id not in task_event_queues:
-                    task_event_queues[task_id] = []
-                task_event_queues[task_id].append(my_queue)
-            logger.info(f"SSE client connected for task {task_id}. Registered queue.")
-
-            current_snapshot_progress = task_progress_store.get(task_id)
-
-            if current_snapshot_progress:
-                yield {"data": json.dumps(current_snapshot_progress)}
-                last_sent_progress_content = current_snapshot_progress
-                logger.debug(f"Sent initial snapshot progress for task {task_id}: {current_snapshot_progress}")
-                # Do not return early if terminal, queue might have earlier states.
-            elif not current_snapshot_progress:
-                 # If task isn't even in the store, it's likely a bogus task_id from client
-                 not_found_payload = {"status": "not_found", "message": "Task ID not found in progress store."}
-                 yield {"data": json.dumps(not_found_payload)}
-                 logger.warning(f"Task ID {task_id} not found in task_progress_store. Sent not_found and closing SSE for this client.")
-                 return
-
-            while True:
-                if await request.is_disconnected():
-                    logger.info(f"SSE client for task {task_id} disconnected.")
-                    break
-
-                try:
-                    # Wait for a new progress update from the queue
-                    # Add a timeout to periodically check for client disconnect
-                    progress_from_queue = await asyncio.wait_for(my_queue.get(), timeout=30.0) 
-                except asyncio.TimeoutError:
-                    # No new progress within timeout, just loop to check disconnect status
-                    logger.debug(f"SSE for task {task_id} timed out waiting for queue, checking disconnect.")
-                    continue 
+        count = 0
+        logger.info(f"[{task_id}] EVENT GENERATOR STARTED")
+        while True:
+            # Disconnect check
+            if await request.is_disconnected():
+                logger.info(f"[{task_id}] CLIENT DISCONNECTED after {count} events")
+                break
                 
-                my_queue.task_done() # Acknowledge message processed from queue
+            # Log waiting for data
+            logger.info(f"[{task_id}] WAITING FOR UPDATE #{count+1}")
+            
+            # Get data from queue
+            data = await queue.get()
+            count += 1
+            logger.info(f"[{task_id}] RECEIVED UPDATE #{count}: {data['status']} - {data['stage']}")
+            
+            # Send to client
+            logger.info(f"[{task_id}] SENDING UPDATE #{count} TO CLIENT")
+            yield {"data": json.dumps(data)}
+            logger.info(f"[{task_id}] SENT UPDATE #{count} TO CLIENT")
+            
+            # Check for completion
+            if data.get("status") in ("complete", "error", "cancelled"):
+                logger.info(f"[{task_id}] FINAL STATUS REACHED: {data['status']} after {count} events")
+                break
+                
+        # Cleanup queue
+        logger.info(f"[{task_id}] CLEANING UP QUEUE")
+        event_queue_store.pop(task_id, None)
+        logger.info(f"[{task_id}] EVENT GENERATOR ENDING")
 
-                if progress_from_queue != last_sent_progress_content:
-                    yield {"data": json.dumps(progress_from_queue)}
-                    last_sent_progress_content = progress_from_queue
-                    logger.debug(f"Sent progress update from queue for task {task_id}: {progress_from_queue}")
-                else:
-                    logger.debug(f"Skipping send from queue for task {task_id} as data is same as last sent: {progress_from_queue}")
-
-                if progress_from_queue.get("status") in ("complete", "error", "cancelled", "not_found"):
-                    logger.info(f"Task {task_id} reached terminal state ({progress_from_queue.get('status')}) via queue. Closing SSE stream.")
-                    break
-        
-        except Exception as e:
-            logger.error(f"Error in SSE event_generator for task {task_id}: {e}", exc_info=True)
-            # Attempt to send an error to the client if possible before closing
-            try:
-                error_payload = {"status": "error", "stage": "sse_stream_failure", "message": "SSE stream failed on server."}
-                yield {"data": json.dumps(error_payload)}
-            except Exception: # Ignore if we can't send (e.g., client already disconnected)
-                pass 
-        finally:
-            # Unregister the queue
-            async with task_event_queues_lock:
-                if task_id in task_event_queues and my_queue in task_event_queues[task_id]:
-                    task_event_queues[task_id].remove(my_queue)
-                    if not task_event_queues[task_id]: # If list is empty, remove task_id entry itself
-                        del task_event_queues[task_id]
-                    logger.info(f"SSE client for task {task_id} cleaned up its queue.")
-                else:
-                    # This might happen if cleanup was already attempted or if the queue wasn't properly registered
-                    logger.warning(f"SSE queue for task {task_id} not found during cleanup or already removed.")
-            logger.info(f"SSE event_generator for task {task_id} finished.")
-
+    logger.info(f"[{task_id}] RETURNING EVENT SOURCE RESPONSE")
     return EventSourceResponse(event_generator())
 
 # --- NEW DOWNLOAD ENDPOINT --- 
@@ -253,88 +263,50 @@ async def download_transcript(filename: str):
 # --- Background task handler ---
 async def run_transcription_task(
     task_id: str,
+    progress_store: Dict[str, Dict[str, Any]],
     video_file_path: Optional[str],
     original_video_filename: Optional[str],
     youtube_url: Optional[str],
     client
 ):
     """Background transcription task, updates progress_store as it goes."""
-    try:
-        # Step 1: Audio preparation
-        if youtube_url:
-            await _update_task_progress_and_notify(
-                task_id,
-                {"status": "processing", "stage": "download", "message": "Downloading audio from YouTube..."}
-            )
-            yt = YouTube(youtube_url)
-            title = yt.title or "youtube_video"
-            stream = yt.streams.filter(only_audio=True, file_extension=Config.PREFERRED_AUDIO_FORMAT).order_by('abr').desc().first() or yt.streams.get_audio_only()
-            if not stream:
-                raise RuntimeError("No suitable audio stream found.")
-            audio_ext = f".{stream.subtype}"
-            temp_audio_name = f"{uuid.uuid4()}_youtube{audio_ext}"
-            temp_audio_path = os.path.join(Config.TEMP_DIR, temp_audio_name)
-            stream.download(output_path=Config.TEMP_DIR, filename=temp_audio_name)
-            await _update_task_progress_and_notify(
-                task_id,
-                {"status": "processing", "stage": "downloaded", "message": "YouTube audio downloaded."}
-            )
-            audio_path = temp_audio_path
-            original_name = title
-        else:
-            await _update_task_progress_and_notify(
-                task_id,
-                {"status": "processing", "stage": "extract", "message": "Extracting audio from uploaded video..."}
-            )
-            audio_path = extract_audio_from_video(video_file_path)
-            await _update_task_progress_and_notify(
-                task_id,
-                {"status": "processing", "stage": "extracted", "message": "Audio extraction complete."}
-            )
-            original_name = original_video_filename
+    # Add the task_id to the current asyncio task name for better log correlation
+    current_task = asyncio.current_task()
+    if current_task:
+        current_task.set_name(f"task-{task_id}")
         
-        # Step 2: Transcription
-        await _update_task_progress_and_notify(
-            task_id,
-            {"status": "processing", "stage": "transcribing", "message": "Transcribing audio (this may take a while)..."}
-        )
-        transcript_path = process_audio_to_transcript(audio_path, client, original_name)
+    logger.info(f"[{task_id}] *** BACKGROUND TASK EXECUTION STARTED ***")
+    try:
+        # Step 1: Audio preparation (offloaded to thread)
+        if youtube_url:
+            logger.info(f"[{task_id}] About to call _update_progress for 'download' stage")
+            _update_progress(task_id, {"status": "processing", "stage": "download", "message": "Downloading audio from YouTube..."})
+            logger.info(f"[{task_id}] Calling asyncio.to_thread for _download_youtube_sync")
+            audio_path, original_name = await asyncio.to_thread(_download_youtube_sync, task_id, youtube_url)
+            logger.info(f"[{task_id}] _download_youtube_sync completed. Path: {audio_path}, Name: {original_name}")
+            _update_progress(task_id, {"status": "processing", "stage": "downloaded", "message": "YouTube audio downloaded."})
+        else:
+            _update_progress(task_id, {"status": "processing", "stage": "extract", "message": "Extracting audio from uploaded video..."})
+            audio_path = await asyncio.to_thread(extract_audio_from_video, video_file_path)
+            _update_progress(task_id, {"status": "processing", "stage": "extracted", "message": "Audio extraction complete."})
+            original_name = original_video_filename
 
-        # Step 3: Complete
-        await _update_task_progress_and_notify(
-            task_id,
-            {"status": "complete", "stage": "finished", "message": "Transcription complete.", "filename": os.path.basename(transcript_path)}
-        )
-    except PytubeFixError as e: # Specific error handling for pytube issues
-        logger.error(f"PytubeFixError in Task {task_id}: {e}", exc_info=True)
-        await _update_task_progress_and_notify(
-            task_id,
-            {"status": "error", "stage": "youtube_download_failed", "message": f"YouTube video processing error: {str(e)}"}
-        )
+        # Step 2: Transcription (offloaded to thread)
+        _update_progress(task_id, {"status": "processing", "stage": "transcribing", "message": "Transcribing audio..."})
+        transcript_path = await asyncio.to_thread(process_audio_to_transcript, task_id, audio_path, client, original_name)
+        _update_progress(task_id, {"status": "complete", "stage": "finished", "message": "Transcription complete.", "filename": os.path.basename(transcript_path)})
+        logger.info(f"[{task_id}] *** BACKGROUND TASK COMPLETED SUCCESSFULLY ***")
     except Exception as e:
-        logger.error(f"Task {task_id} failed: {e}", exc_info=True)
-        await _update_task_progress_and_notify(
-            task_id,
-            {"status": "error", "stage": "failed", "message": str(e)}
-        )
+        logger.error(f"[{task_id}] TASK FAILED: {e}", exc_info=True)
+        _update_progress(task_id, {"status": "error", "stage": "failed", "message": str(e)})
+        logger.info(f"[{task_id}] *** BACKGROUND TASK FAILED ***")
     finally:
         # Cleanup temp files
-        if youtube_url and 'temp_audio_path' in locals() and os.path.exists(temp_audio_path):
-            clean_temp_file(temp_audio_path)
-        if video_file_path and os.path.exists(video_file_path): # Ensure it exists before trying to clean
+        logger.info(f"[{task_id}] CLEANUP STARTING")
+        if youtube_url and 'temp_audio_path' in locals():
+            logger.info(f"[{task_id}] REMOVING TEMP AUDIO: {audio_path}")
+            clean_temp_file(audio_path)
+        if video_file_path:
+            logger.info(f"[{task_id}] REMOVING TEMP VIDEO: {video_file_path}")
             clean_temp_file(video_file_path)
-        # No need to clean audio_path if it's the same as temp_audio_path or derived from video_file_path's audio extraction
-        # (as those are handled above). If extract_audio_from_video creates a new distinct temp file, it should be cleaned there
-        # or its path returned for cleaning here. The current `extract_audio_from_video` seems to do that.
-        # The `process_audio_to_transcript` also cleans its own chunks.
-
-        # Final check for task_progress_store to ensure a terminal state is set if not already
-        final_state = task_progress_store.get(task_id)
-        if final_state and final_state.get("status") not in ("complete", "error", "cancelled"):
-            # This case should ideally not be hit if all exit paths in try/except update the status.
-            # However, as a safeguard:
-            logger.warning(f"Task {task_id} ended without a clear terminal status. Marking as error.")
-            await _update_task_progress_and_notify(
-                task_id,
-                {"status": "error", "stage": "unknown_failure", "message": "Task ended with an undetermined error."}
-            ) 
+        logger.info(f"[{task_id}] CLEANUP COMPLETE - TASK FINISHED") 
