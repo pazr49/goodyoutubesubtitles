@@ -39,7 +39,9 @@ def create_app() -> FastAPI:
         "http://localhost:3000",
         "http://localhost:8080",
         "http://localhost:5173",
-        # Production API URL (allows frontend hosted elsewhere to call API)
+        # Production frontend URL
+        "https://ezsubtitles.vercel.app",
+        # Production API URL (allows API docs served from FastAPI to work, or calls from same domain)
         "https://past-oven-production.up.railway.app", 
     ]
 
