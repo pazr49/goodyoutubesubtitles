@@ -258,6 +258,27 @@ async def download_transcript(filename: str):
         logger.error(f"Error during file download for {filename}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error while retrieving file.") 
 
+@router.get("/list-files")
+async def list_files():
+    """Lists all files in the temp directory."""
+    try:
+        files = []
+        for filename in os.listdir(Config.TEMP_DIR):
+            file_path = os.path.join(Config.TEMP_DIR, filename)
+            if os.path.isfile(file_path):
+                size = os.path.getsize(file_path)
+                modified = os.path.getmtime(file_path)
+                files.append({
+                    "name": filename,
+                    "size_bytes": size,
+                    "modified": modified,
+                    "type": "sbv" if filename.endswith(".sbv") else "other"
+                })
+        return {"files": files}
+    except Exception as e:
+        logger.error(f"Error listing files: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # --- Background task handler ---
 async def run_transcription_task(
     task_id: str,
