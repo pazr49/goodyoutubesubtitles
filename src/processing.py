@@ -1,12 +1,15 @@
 import os
 import logging
 import uuid
+import subprocess
+import json
 from typing import List, Any, Callable, Optional, Dict
 import shutil # Added for cleaning up chunk files
 
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from elevenlabs.client import ElevenLabs
-from pydub import AudioSegment # Added for audio manipulation
+# Commenting out pydub which has compatibility issues with Python 3.13
+# from pydub import AudioSegment # Added for audio manipulation
 # from pydub.utils import make_chunks # We might use this, or implement manually for overlap
 
 from .config import Config # Relative imports
@@ -18,81 +21,139 @@ logger = logging.getLogger(__name__)
 CHUNK_LENGTH_S = 5 * 60  # 5 minutes in seconds
 OVERLAP_S = 5          # 5 seconds overlap
 
+def _get_audio_duration(task_id_for_log: str, audio_path: str) -> float:
+    """
+    Get the duration of an audio file using ffprobe.
+    Returns the duration in seconds.
+    """
+    logger.info(f"[{task_id_for_log}] Getting duration for audio file: {audio_path}")
+    
+    try:
+        # Use ffprobe to get audio duration
+        command = [
+            os.path.join(os.path.dirname(Config.FFMPEG_PATH), "ffprobe"),
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            audio_path
+        ]
+        
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        duration = float(data["format"]["duration"])
+        
+        logger.info(f"[{task_id_for_log}] Audio duration: {duration:.2f}s")
+        return duration
+    except Exception as e:
+        logger.error(f"[{task_id_for_log}] Error getting audio duration: {e}")
+        # Return a reasonable default (30 minutes) if we can't determine the duration
+        # This will cause chunking to proceed with potentially incorrect chunks
+        return 30 * 60
+
 def _split_audio_into_chunks(task_id_for_log: str, audio_path: str, original_name: str) -> List[tuple[str, float]]:
     """
-    Splits an audio file into chunks with overlap.
+    Splits an audio file into chunks with overlap using FFmpeg.
     Returns a list of tuples: (chunk_file_path, chunk_start_time_seconds).
     """
     logger.info(f"[{task_id_for_log}] Splitting audio file: {audio_path} into {CHUNK_LENGTH_S}s chunks with {OVERLAP_S}s overlap.")
     chunk_paths_with_starts = []
     
     try:
-        audio = AudioSegment.from_file(audio_path)
-        logger.info(f"[{task_id_for_log}] Audio duration: {len(audio) / 1000.0:.2f}s")
-    except Exception as e:
-        logger.error(f"[{task_id_for_log}] Failed to load audio file {audio_path} with pydub: {e}", exc_info=True)
-        raise ValueError(f"Pydub failed to load audio: {e}")
-
-    chunk_length_ms = CHUNK_LENGTH_S * 1000
-    overlap_ms = OVERLAP_S * 1000
-    
-    step_ms = chunk_length_ms - overlap_ms
-    if step_ms <= 0:
-        logger.warning(f"[{task_id_for_log}] Overlap is greater than or equal to chunk length for {original_name}. Audio will not be split effectively.")
-        if len(audio) <= chunk_length_ms:
-            # Determine file extension safely
-            audio_format = getattr(audio, 'format', None) or os.path.splitext(audio_path)[1].lstrip('.') or 'mp3'
-            chunk_filename = f"{os.path.splitext(original_name)[0]}_chunk_0_{uuid.uuid4().hex[:8]}.{audio_format}"
-            chunk_path = os.path.join(Config.TEMP_DIR, chunk_filename)
-            audio.export(chunk_path, format=audio_format)
-            logger.info(f"[{task_id_for_log}] Audio shorter than a chunk or invalid step, processing as one: {chunk_path}")
-            return [(chunk_path, 0.0)]
-        else:
-            step_ms = chunk_length_ms
-
-    idx = 0
-    current_pos_ms = 0
-    while current_pos_ms < len(audio):
-        chunk_start_ms = current_pos_ms
-        chunk_end_ms = current_pos_ms + chunk_length_ms
-        actual_chunk_end_ms = min(chunk_end_ms, len(audio))
+        # Get the audio duration
+        audio_duration = _get_audio_duration(task_id_for_log, audio_path)
         
-        chunk = audio[chunk_start_ms:actual_chunk_end_ms]
-        
-        if len(chunk) == 0:
-            logger.warning(f"[{task_id_for_log}] Empty chunk generated at index {idx} for {original_name}, start_ms {chunk_start_ms}. Skipping.")
-            current_pos_ms += step_ms
-            continue
-
-        chunk_base_name = os.path.splitext(original_name)[0]
-        file_extension = getattr(audio, 'format', None) or os.path.splitext(audio_path)[1].lstrip('.') or "mp3"
-        chunk_filename = f"{chunk_base_name}_chunk_{idx}_{uuid.uuid4().hex[:8]}.{file_extension}"
-        chunk_path = os.path.join(Config.TEMP_DIR, chunk_filename)
-        
-        try:
-            logger.info(f"[{task_id_for_log}] Exporting chunk {idx}: {chunk_path} (covers {chunk_start_ms/1000.0:.2f}s to {actual_chunk_end_ms/1000.0:.2f}s of original)")
-            chunk.export(chunk_path, format=file_extension)
-            chunk_paths_with_starts.append((chunk_path, chunk_start_ms / 1000.0))
-        except Exception as e:
-            logger.error(f"[{task_id_for_log}] Failed to export audio chunk {chunk_path} for {original_name}: {e}", exc_info=True)
+        # If audio is shorter than a chunk, just return it as is
+        if audio_duration <= CHUNK_LENGTH_S:
+            logger.info(f"[{task_id_for_log}] Audio shorter than chunk length, using as single chunk.")
+            ext = os.path.splitext(audio_path)[1]
+            single_chunk_filename = f"{os.path.splitext(original_name)[0]}_single_chunk_{uuid.uuid4().hex[:8]}{ext}"
+            single_chunk_path = os.path.join(Config.TEMP_DIR, single_chunk_filename)
             
-        idx += 1
-        if actual_chunk_end_ms == len(audio):
-            break
-        current_pos_ms += step_ms
-        if len(audio) - current_pos_ms < overlap_ms and current_pos_ms < len(audio):
-             pass # Already handled by loop condition and min()
-
-    if not chunk_paths_with_starts and len(audio) > 0:
-        logger.warning(f"[{task_id_for_log}] Splitting resulted in no chunks for {audio_path} (original: {original_name}). Treating as a single chunk.")
-        audio_format = getattr(audio, 'format', None) or os.path.splitext(audio_path)[1].lstrip('.') or 'mp3'
-        single_chunk_filename = f"{os.path.splitext(original_name)[0]}_single_chunk_{uuid.uuid4().hex[:8]}.{audio_format}"
-        single_chunk_path = os.path.join(Config.TEMP_DIR, single_chunk_filename)
-        audio.export(single_chunk_path, format=audio_format)
-        return [(single_chunk_path, 0.0)]
+            # Copy the file instead of transcoding
+            shutil.copy2(audio_path, single_chunk_path)
+            return [(single_chunk_path, 0.0)]
         
-    logger.info(f"[{task_id_for_log}] Successfully split '{original_name}' into {len(chunk_paths_with_starts)} chunks.")
-    return chunk_paths_with_starts
+        # Calculate step size for chunks (accounting for overlap)
+        step_size = CHUNK_LENGTH_S - OVERLAP_S
+        
+        # Generate chunks
+        idx = 0
+        current_pos = 0.0
+        
+        while current_pos < audio_duration:
+            chunk_start = current_pos
+            chunk_end = min(current_pos + CHUNK_LENGTH_S, audio_duration)
+            
+            # Skip if we'd create an empty chunk
+            if chunk_end <= chunk_start:
+                break
+                
+            chunk_duration = chunk_end - chunk_start
+            
+            # Skip very short chunks at the end
+            if chunk_duration < 1.0 and idx > 0:  # 1 second minimum, and not the first chunk
+                break
+                
+            # Create chunk filename
+            chunk_base_name = os.path.splitext(original_name)[0]
+            ext = os.path.splitext(audio_path)[1]
+            chunk_filename = f"{chunk_base_name}_chunk_{idx}_{uuid.uuid4().hex[:8]}{ext}"
+            chunk_path = os.path.join(Config.TEMP_DIR, chunk_filename)
+            
+            # FFmpeg command to extract the chunk
+            command = [
+                Config.FFMPEG_PATH,
+                "-ss", str(chunk_start),
+                "-i", audio_path,
+                "-t", str(chunk_duration),
+                "-c", "copy",  # Use copy codec for speed 
+                "-y",
+                chunk_path
+            ]
+            
+            logger.info(f"[{task_id_for_log}] Extracting chunk {idx}: covers {chunk_start:.2f}s to {chunk_end:.2f}s of original")
+            
+            try:
+                process = subprocess.run(command, capture_output=True, text=True, check=True)
+                if process.stderr:
+                    logger.debug(f"[{task_id_for_log}] FFmpeg chunk {idx} stderr: {process.stderr}")
+                
+                chunk_paths_with_starts.append((chunk_path, chunk_start))
+                logger.info(f"[{task_id_for_log}] Chunk {idx} extracted to: {chunk_path}")
+            except Exception as e:
+                logger.error(f"[{task_id_for_log}] Failed to extract chunk {idx}: {e}")
+                # Continue to next chunk if this one fails
+            
+            idx += 1
+            current_pos += step_size
+            
+            # Break if we've reached the end of the audio
+            if chunk_end >= audio_duration:
+                break
+        
+        if not chunk_paths_with_starts:
+            logger.warning(f"[{task_id_for_log}] No chunks created for {audio_path}. Treating as a single file.")
+            ext = os.path.splitext(audio_path)[1]
+            single_chunk_filename = f"{os.path.splitext(original_name)[0]}_single_chunk_{uuid.uuid4().hex[:8]}{ext}"
+            single_chunk_path = os.path.join(Config.TEMP_DIR, single_chunk_filename)
+            
+            # Copy the file instead of transcoding
+            shutil.copy2(audio_path, single_chunk_path)
+            return [(single_chunk_path, 0.0)]
+            
+        logger.info(f"[{task_id_for_log}] Successfully split '{original_name}' into {len(chunk_paths_with_starts)} chunks.")
+        return chunk_paths_with_starts
+        
+    except Exception as e:
+        logger.error(f"[{task_id_for_log}] Error splitting audio: {e}")
+        # If chunking fails, return the original audio file as a single chunk
+        ext = os.path.splitext(audio_path)[1]
+        single_chunk_filename = f"{os.path.splitext(original_name)[0]}_error_chunk_{uuid.uuid4().hex[:8]}{ext}"
+        single_chunk_path = os.path.join(Config.TEMP_DIR, single_chunk_filename)
+        
+        # Copy the file instead of transcoding
+        shutil.copy2(audio_path, single_chunk_path)
+        return [(single_chunk_path, 0.0)]
 
 def _stitch_transcriptions(task_id_for_log: str, chunk_word_data_list: List[tuple[List[Any], float]], overlap_s: float) -> List[Any]:
     """
@@ -337,32 +398,46 @@ def process_audio_to_transcript(
              clean_temp_file(chunk_path)
 
 def extract_audio_from_video(task_id_for_log: str, video_path: str) -> str:
-    """Extract audio from video file and return audio file path"""
-    logger.info(f"[{task_id_for_log}] Starting audio extraction from video: {video_path}")
-    base_name = os.path.splitext(os.path.basename(video_path))[0]
-    audio_filename = f"{base_name}_{uuid.uuid4().hex[:8]}.mp3"
-    audio_path = os.path.join(Config.TEMP_DIR, audio_filename)
-    
+    """
+    Extracts audio from a video file using ffmpeg directly for efficiency.
+    Returns the path to the extracted audio file.
+    """
+    logger.info(f"[{task_id_for_log}] Starting audio extraction for {video_path} using direct ffmpeg.")
+
+    os.makedirs(Config.TEMP_DIR, exist_ok=True)
+
+    output_audio_filename = f"{uuid.uuid4()}_extracted_audio.{Config.PREFERRED_AUDIO_FORMAT_FOR_EXTRACTION}"
+    output_audio_path = os.path.join(Config.TEMP_DIR, output_audio_filename)
+
+    command = [
+        Config.FFMPEG_PATH,
+        '-i', video_path,
+        '-vn',  # No video output
+        '-c:a', 'aac',  # Default to AAC codec
+        '-ar', '44100', # Audio sample rate
+        '-b:a', '192k', # Audio bitrate
+        '-y', # Overwrite output file without asking
+        output_audio_path
+    ]
+
+    if Config.PREFERRED_AUDIO_FORMAT_FOR_EXTRACTION.lower() == "mp3":
+        command[5] = 'libmp3lame' # Change codec if mp3 is preferred
+
+    logger.info(f"[{task_id_for_log}] Executing ffmpeg command: {' '.join(command)}")
+
     try:
-        logger.info(f"[{task_id_for_log}] Creating VideoFileClip for: {video_path}")
-        video_clip = VideoFileClip(video_path)
-        logger.info(f"[{task_id_for_log}] Extracting audio to {audio_path} (codec=mp3, bitrate={Config.AUDIO_BITRATE})")
-        video_clip.audio.write_audiofile(
-            audio_path, 
-            codec='mp3', 
-            bitrate=Config.AUDIO_BITRATE, 
-            logger=None # Suppress moviepy's own verbose logs
-        )
-        video_clip.close()
-        logger.info(f"[{task_id_for_log}] Audio extraction successful: {audio_path}")
-        return audio_path
-    except Exception as e:
-        logger.error(f"[{task_id_for_log}] Failed to extract audio from video {video_path}: {str(e)}", exc_info=True)
-        if os.path.exists(audio_path):
-            try:
-                logger.info(f"[{task_id_for_log}] Attempting to clean up partially created audio file: {audio_path}")
-                os.remove(audio_path)
-                logger.info(f"[{task_id_for_log}] Cleaned up partially created audio file: {audio_path}")
-            except OSError as cleanup_e:
-                logger.warning(f"[{task_id_for_log}] Failed to clean up partial audio file {audio_path}: {cleanup_e}")
-        raise ValueError(f"Failed to extract audio from video '{video_path}': {e}") from e 
+        process = subprocess.run(command, capture_output=True, text=True, check=True)
+        if process.stdout: # Log stdout only if it has content
+            logger.info(f"[{task_id_for_log}] FFmpeg stdout: {process.stdout}")
+        if process.stderr: # Log stderr only if it has content (ffmpeg often uses stderr for info)
+            logger.debug(f"[{task_id_for_log}] FFmpeg stderr: {process.stderr}")
+        logger.info(f"[{task_id_for_log}] Audio extracted successfully to {output_audio_path}")
+        return output_audio_path
+    except subprocess.CalledProcessError as e:
+        logger.error(f"[{task_id_for_log}] FFmpeg failed for {video_path}.")
+        logger.error(f"[{task_id_for_log}] FFmpeg stderr: {e.stderr}")
+        logger.error(f"[{task_id_for_log}] FFmpeg stdout: {e.stdout}")
+        raise RuntimeError(f"FFmpeg audio extraction failed: {e.stderr}") from e
+    except FileNotFoundError:
+        logger.error(f"[{task_id_for_log}] ffmpeg command not found at '{Config.FFMPEG_PATH}'. Ensure ffmpeg is installed and in PATH, or Config.FFMPEG_PATH is set correctly.")
+        raise RuntimeError(f"ffmpeg not found. Please ensure it's installed and accessible.") 

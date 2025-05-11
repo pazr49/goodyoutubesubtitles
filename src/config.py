@@ -45,6 +45,10 @@ class Config:
     # Audio settings
     PREFERRED_AUDIO_FORMAT = "m4a"
     AUDIO_BITRATE = "320k"
+    
+    # FFmpeg settings (new)
+    FFMPEG_PATH = r"C:\ffmpeg\bin\ffmpeg.exe"  # Full path to ffmpeg executable
+    PREFERRED_AUDIO_FORMAT_FOR_EXTRACTION = "mp3"  # Format for extracted audio
 
 # --- Setup ---
 # Create directory for temporary files
