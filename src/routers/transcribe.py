@@ -4,7 +4,8 @@ import shutil
 import logging
 from pathlib import Path # Import Path
 import time # Add for timestamps
-import subprocess # Add subprocess for yt-dlp
+# subprocess might be removable now from here if not used by other parts
+# import subprocess # Add subprocess for yt-dlp
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.responses import FileResponse # Import FileResponse
@@ -19,146 +20,21 @@ from ..models import TranscriptionResponse, YouTubeRequest
 from ..dependencies import get_elevenlabs_client
 from ..processing import extract_audio_from_video, process_audio_to_transcript
 from ..utils import clean_temp_file
+# NEW: Import for refactored YouTube download functions
+from ..youtube_download import download_youtube_pytubefix_sync, download_youtube_yt_dlp_sync
+# NEW: Import for refactored task management
+from ..task_management import (
+    update_task_progress,
+    get_or_create_task_event_queue,
+    get_task_current_progress,
+    remove_task_event_queue
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter() # Create a router instance
 
-# Add in-memory task progress store
-# Keyed by task_id, each value is a dict with status, stage, message, and optional filename or error
-task_progress_store: Dict[str, Dict[str, Any]] = {}
-
-# Queue store for SSE subscribers, keyed by task_id
-event_queue_store: Dict[str, asyncio.Queue] = {}
-
-# Helper to update progress_store and notify SSE clients
-def _update_progress(task_id: str, progress: Dict[str, Any]):
-    logger.info(f"[{task_id}] UPDATING PROGRESS: {progress['status']} - {progress['stage']}")
-    task_progress_store[task_id] = progress
-    queue = event_queue_store.get(task_id)
-    if queue:
-        queue.put_nowait(progress.copy())
-        logger.info(f"[{task_id}] QUEUED UPDATE: {progress['status']} - {progress['stage']}")
-    else:
-        logger.warning(f"[{task_id}] NO QUEUE FOUND when trying to update progress: {progress['status']} - {progress['stage']}")
-
-# Helper to download YouTube audio in a sync thread
-def _download_youtube_sync(task_id_for_log: str, youtube_url: str) -> tuple[str, str]:
-    """Synchronously download YouTube audio and return file path and title."""
-    logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_SYNC: Initializing YouTube object for {youtube_url[:30]}... with use_po_token=True")
-    yt = YouTube(youtube_url, use_po_token=True)
-    title = yt.title or "youtube_video"
-    logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_SYNC: Video Title - {title}")
-    
-    logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_SYNC: Selecting audio stream...")
-    stream = yt.streams.filter(
-        only_audio=True,
-        file_extension=Config.PREFERRED_AUDIO_FORMAT
-    ).order_by('abr').desc().first() or yt.streams.get_audio_only()
-    
-    if not stream:
-        logger.error(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_SYNC: No suitable audio stream found.")
-        raise RuntimeError("No suitable audio stream found.")
-        
-    audio_ext = f".{stream.subtype}"
-    # Use a more descriptive temp_audio_name that includes a UUID for uniqueness
-    temp_audio_name = f"{_uuid.uuid4()}_youtube{audio_ext}" 
-    temp_audio_path = os.path.join(Config.TEMP_DIR, temp_audio_name)
-    logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_SYNC: Downloading stream to {temp_audio_path}")
-    
-    download_start_time = time.time()
-    stream.download(output_path=Config.TEMP_DIR, filename=temp_audio_name)
-    download_duration = time.time() - download_start_time
-    logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_SYNC: Download complete in {download_duration:.2f} seconds. Path: {temp_audio_path}")
-    
-    return temp_audio_path, title
-
-# --- NEW: Helper to download YouTube audio using yt-dlp ---
-def _download_youtube_yt_dlp_sync(task_id_for_log: str, youtube_url: str) -> tuple[str, str]:
-    """Synchronously download YouTube audio using yt-dlp and return file path and title."""
-    logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Starting download for {youtube_url[:50]}...")
-
-    temp_audio_basename = f"{_uuid.uuid4()}_youtube_yt_dlp"
-    # yt-dlp will add the correct extension based on the format chosen
-    # We will tell it to output to a specific path with a specific name pattern
-    # and then find the resulting file.
-    output_template = os.path.join(Config.TEMP_DIR, f"{temp_audio_basename}.%(ext)s")
-    
-    # Get video title first using yt-dlp to get the original name
-    title = "youtube_video" # Default title
-    try:
-        title_command = [
-            "yt-dlp",
-            "--get-title",
-            "--no-warnings",
-            youtube_url
-        ]
-        title_process = subprocess.run(title_command, capture_output=True, text=True, check=True, encoding='utf-8')
-        title = title_process.stdout.strip() or title
-        logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Video Title - {title}")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Failed to get title. stderr: {e.stderr}")
-        # Continue with default title, download might still work
-    except FileNotFoundError:
-        logger.error(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: yt-dlp command not found. Ensure it's installed and in PATH.")
-        raise RuntimeError("yt-dlp not found. Please ensure it's installed and accessible.")
-
-    # Command to download audio
-    # -x: extract audio
-    # --audio-format mp3: convert to mp3 (can be changed via Config if needed)
-    # -o <template>: output template
-    # --no-warnings: suppress warnings
-    # --no-playlist: download only the video if URL is part of a playlist
-    # --ffmpeg-location: path to ffmpeg executable
-    command = [
-        "yt-dlp",
-        "-x", # Extract audio
-        "--audio-format", Config.PREFERRED_AUDIO_FORMAT_FOR_EXTRACTION, # e.g., mp3
-        "-o", output_template,
-        "--ffmpeg-location", Config.FFMPEG_PATH,
-        "--no-warnings",
-        "--no-playlist",
-        youtube_url
-    ]
-
-    logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Executing command: {' '.join(command)}")
-    download_start_time = time.time()
-
-    try:
-        process = subprocess.run(command, capture_output=True, text=True, check=True, encoding='utf-8')
-        if process.stderr:
-            logger.debug(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: yt-dlp stderr: {process.stderr}")
-        if process.stdout:
-            logger.debug(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: yt-dlp stdout: {process.stdout}")
-        
-        download_duration = time.time() - download_start_time
-
-        # yt-dlp adds the extension, so we need to find the exact output file name
-        # This is a bit naive if multiple files match, but given UUID it should be unique
-        expected_extension = Config.PREFERRED_AUDIO_FORMAT_FOR_EXTRACTION
-        temp_audio_path = os.path.join(Config.TEMP_DIR, f"{temp_audio_basename}.{expected_extension}")
-
-        if not os.path.exists(temp_audio_path):
-            # Fallback: list directory to find the file if exact match fails (e.g. if ext was different)
-            logger.warning(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Expected file {temp_audio_path} not found. Searching in TEMP_DIR...")
-            found_files = [f for f in os.listdir(Config.TEMP_DIR) if f.startswith(temp_audio_basename)]
-            if found_files:
-                temp_audio_path = os.path.join(Config.TEMP_DIR, found_files[0])
-                logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Found file {temp_audio_path}")
-            else:
-                logger.error(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Output audio file not found after download for basename {temp_audio_basename}")
-                raise RuntimeError("yt-dlp downloaded, but output file could not be found.")
-
-        logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Download complete in {download_duration:.2f} seconds. Path: {temp_audio_path}")
-        return temp_audio_path, title
-
-    except subprocess.CalledProcessError as e:
-        logger.error(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: yt-dlp failed. Return code: {e.returncode}")
-        logger.error(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: yt-dlp stderr: {e.stderr}")
-        logger.error(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: yt-dlp stdout: {e.stdout}")
-        raise RuntimeError(f"yt-dlp failed: {e.stderr or 'Unknown error'}")
-    except FileNotFoundError: # Should be caught by title check, but as a safeguard
-        logger.error(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: yt-dlp command not found. Ensure it's installed and in PATH.")
-        raise RuntimeError("yt-dlp not found. Please ensure it's installed and accessible.")
+# --- Task and Event Queue stores are now in src/task_management.py ---
+# --- _update_progress helper is now update_task_progress in src/task_management.py ---
 
 # --- API Endpoints using the router ---
 @router.get("/ping")
@@ -193,9 +69,8 @@ async def transcribe_video(
     await video_file.close()
     # Prepare task
     task_id = str(uuid.uuid4())
-    # Initialize queue and publish initial state
-    event_queue_store[task_id] = asyncio.Queue()
-    _update_progress(task_id, {"status": "queued", "stage": "uploaded", "message": "Video uploaded, ready to start transcription."})
+    get_or_create_task_event_queue(task_id) # Initialize queue
+    update_task_progress(task_id, {"status": "queued", "stage": "uploaded", "message": "Video uploaded, ready to start transcription."})
     # Schedule background task
     background_tasks.add_task(
         run_transcription_task,
@@ -213,30 +88,29 @@ async def transcribe_youtube(
     background_tasks: BackgroundTasks,
     client = Depends(get_elevenlabs_client)
 ):
-    # Validate youtube dependency
-    if not YouTube or not PytubeFixError:
-        raise HTTPException(status_code=501, detail="YouTube processing dependency not available.")
     url = str(request.url)
-    
-    # Log receipt of request
     logger.info(f"YOUTUBE REQUEST RECEIVED: {url[:30]}...")
+
+    # If pytubefix is the *only* strategy or a possible one, this check is fine.
+    # If we *only* allow yt-dlp, this check could be removed or conditional.
+    # For now, keeping it, as the download function for pytubefix also has an internal check.
+    if Config.YOUTUBE_DOWNLOAD_STRATEGY == "pytubefix" and (not YouTube or not PytubeFixError):
+        logger.error(f"Pytubefix strategy selected but Pytubefix/YouTube library not available.")
+        raise HTTPException(status_code=501, detail="Pytubefix (YouTube) processing dependency not available for selected strategy.")
     
-    # Prepare task
     task_id = str(uuid.uuid4())
     logger.info(f"[{task_id}] TASK ID GENERATED")
     
-    # Initialize queue and publish initial state
-    event_queue_store[task_id] = asyncio.Queue()
-    logger.info(f"[{task_id}] CREATED QUEUE")
+    get_or_create_task_event_queue(task_id) # Initialize queue
+    logger.info(f"[{task_id}] CREATED QUEUE (via task_management)")
     
-    _update_progress(task_id, {"status": "queued", "stage": "initialized", "message": "YouTube transcription queued."})
+    update_task_progress(task_id, {"status": "queued", "stage": "initialized", "message": "YouTube transcription queued."})
     
-    # Schedule background task but add a small delay to ensure endpoints return first
     logger.info(f"[{task_id}] SCHEDULING BACKGROUND TASK (with 0.5s delay)")
     
     async def delayed_task():
         logger.info(f"[{task_id}] BACKGROUND TASK DELAY ACTIVE - waiting 0.5s before starting")
-        await asyncio.sleep(0.5)  # Small delay to ensure endpoint returns and SSE can connect
+        await asyncio.sleep(0.5)
         logger.info(f"[{task_id}] BACKGROUND TASK STARTING PROCESSING")
         await run_transcription_task(
             task_id,
@@ -256,15 +130,13 @@ async def stream_progress(task_id: str, request: Request):
     """Server-Sent Events endpoint to stream task progress updates."""
     logger.info(f"[{task_id}] SSE CONNECTION ESTABLISHED")
     
-    # Ensure a queue exists for this task
-    queue = event_queue_store.setdefault(task_id, asyncio.Queue())
-    logger.info(f"[{task_id}] QUEUE RETRIEVED/CREATED")
+    queue = get_or_create_task_event_queue(task_id)
+    logger.info(f"[{task_id}] QUEUE RETRIEVED/CREATED (via task_management)")
     
-    # Push current state if available
-    if task_progress_store.get(task_id):
-        current_state = task_progress_store[task_id].copy()
-        logger.info(f"[{task_id}] FOUND EXISTING STATE: {current_state['status']} - {current_state['stage']}")
-        await queue.put(current_state)
+    current_state = get_task_current_progress(task_id)
+    if current_state:
+        logger.info(f"[{task_id}] FOUND EXISTING STATE: {current_state.get('status')} - {current_state.get('stage')}")
+        await queue.put(current_state.copy()) # Use .copy() here too
         logger.info(f"[{task_id}] QUEUED EXISTING STATE")
     else:
         logger.warning(f"[{task_id}] NO EXISTING STATE FOUND for SSE connection")
@@ -272,34 +144,27 @@ async def stream_progress(task_id: str, request: Request):
     async def event_generator():
         count = 0
         logger.info(f"[{task_id}] EVENT GENERATOR STARTED")
-        while True:
-            # Disconnect check
-            if await request.is_disconnected():
-                logger.info(f"[{task_id}] CLIENT DISCONNECTED after {count} events")
-                break
+        try:
+            while True:
+                if await request.is_disconnected():
+                    logger.info(f"[{task_id}] CLIENT DISCONNECTED after {count} events")
+                    break
+                    
+                logger.info(f"[{task_id}] WAITING FOR UPDATE #{count+1}")
+                data = await queue.get()
+                count += 1
+                logger.info(f"[{task_id}] RECEIVED UPDATE #{count}: {data.get('status')} - {data.get('stage')}")
                 
-            # Log waiting for data
-            logger.info(f"[{task_id}] WAITING FOR UPDATE #{count+1}")
-            
-            # Get data from queue
-            data = await queue.get()
-            count += 1
-            logger.info(f"[{task_id}] RECEIVED UPDATE #{count}: {data['status']} - {data['stage']}")
-            
-            # Send to client
-            logger.info(f"[{task_id}] SENDING UPDATE #{count} TO CLIENT")
-            yield {"data": json.dumps(data)}
-            logger.info(f"[{task_id}] SENT UPDATE #{count} TO CLIENT")
-            
-            # Check for completion
-            if data.get("status") in ("complete", "error", "cancelled"):
-                logger.info(f"[{task_id}] FINAL STATUS REACHED: {data['status']} after {count} events")
-                break
+                yield {"data": json.dumps(data)}
+                logger.info(f"[{task_id}] SENT UPDATE #{count} TO CLIENT")
                 
-        # Cleanup queue
-        logger.info(f"[{task_id}] CLEANING UP QUEUE")
-        event_queue_store.pop(task_id, None)
-        logger.info(f"[{task_id}] EVENT GENERATOR ENDING")
+                if data.get("status") in ("complete", "error", "cancelled"):
+                    logger.info(f"[{task_id}] FINAL STATUS REACHED: {data.get('status')} after {count} events")
+                    break
+        finally:
+            logger.info(f"[{task_id}] CLEANING UP QUEUE (via task_management)")
+            remove_task_event_queue(task_id)
+            logger.info(f"[{task_id}] EVENT GENERATOR ENDING")
 
     logger.info(f"[{task_id}] RETURNING EVENT SOURCE RESPONSE")
     return EventSourceResponse(event_generator())
@@ -383,45 +248,56 @@ async def run_transcription_task(
         
     logger.info(f"[{task_id}] *** BACKGROUND TASK EXECUTION STARTED for '{original_video_filename or youtube_url}'. ***")
 
-    def progress_callback_for_processing(progress_update: Dict[str, Any]):
-        _update_progress(task_id, progress_update)
+    # Use the imported progress callback function from task_management
+    # The `run_transcription_task` itself will call `update_task_progress` directly.
+    # The `process_audio_to_transcript` function needs a callback that matches the expected signature.
+    # So we pass `update_task_progress` directly if its signature matches, or wrap it if needed.
+    # For now, assuming `process_audio_to_transcript` expects `def callback(update: Dict[str, Any])`
+    # and `update_task_progress` has `task_id` as its first arg.
+    # We need a small wrapper here for the callback passed to `process_audio_to_transcript`.
+    def callback_for_processing(progress_update_dict: Dict[str, Any]):
+        update_task_progress(task_id, progress_update_dict)
 
     audio_path_to_clean: Optional[str] = None # Keep track of audio file for cleanup
 
     try:
         if youtube_url:
             logger.info(f"[{task_id}] Preparing to download audio from YouTube: {youtube_url} using strategy: {Config.YOUTUBE_DOWNLOAD_STRATEGY}")
-            _update_progress(task_id, {"status": "processing", "stage": "download", "message": f"Downloading audio from YouTube ({Config.YOUTUBE_DOWNLOAD_STRATEGY})..."})
+            update_task_progress(task_id, {"status": "processing", "stage": "download", "message": f"Downloading audio from YouTube ({Config.YOUTUBE_DOWNLOAD_STRATEGY})..."})
             
             if Config.YOUTUBE_DOWNLOAD_STRATEGY == "yt-dlp":
-                audio_path, original_name = await asyncio.to_thread(_download_youtube_yt_dlp_sync, task_id, youtube_url)
+                audio_path, original_name = await asyncio.to_thread(download_youtube_yt_dlp_sync, task_id, youtube_url)
             elif Config.YOUTUBE_DOWNLOAD_STRATEGY == "pytubefix":
-                audio_path, original_name = await asyncio.to_thread(_download_youtube_sync, task_id, youtube_url)
+                # Ensure Pytubefix is available if this strategy is chosen
+                if not YouTube or not PytubeFixError: # This check is now also inside download_youtube_pytubefix_sync
+                    logger.error(f"[{task_id}] Pytubefix strategy selected but Pytubefix/YouTube library not available.")
+                    raise RuntimeError("Pytubefix (YouTube) library not available for selected strategy.")
+                audio_path, original_name = await asyncio.to_thread(download_youtube_pytubefix_sync, task_id, youtube_url)
             else:
                 logger.error(f"[{task_id}] Invalid YOUTUBE_DOWNLOAD_STRATEGY: {Config.YOUTUBE_DOWNLOAD_STRATEGY}")
                 raise ValueError(f"Invalid YOUTUBE_DOWNLOAD_STRATEGY: {Config.YOUTUBE_DOWNLOAD_STRATEGY}. Choose 'pytubefix' or 'yt-dlp'.")
 
             audio_path_to_clean = audio_path # Mark for cleanup
             logger.info(f"[{task_id}] YouTube audio download complete. Path: {audio_path}, Original Name: {original_name}")
-            _update_progress(task_id, {"status": "processing", "stage": "downloaded", "message": "YouTube audio downloaded."})
+            update_task_progress(task_id, {"status": "processing", "stage": "downloaded", "message": "YouTube audio downloaded."})
         
         elif video_file_path:
             logger.info(f"[{task_id}] Preparing to extract audio from video file: {video_file_path}")
-            _update_progress(task_id, {"status": "processing", "stage": "extract", "message": f"Extracting audio from '{original_video_filename}'"})
+            update_task_progress(task_id, {"status": "processing", "stage": "extract", "message": f"Extracting audio from '{original_video_filename}'"})
             
             # Note: extract_audio_from_video now takes task_id and logs with it
             audio_path = await asyncio.to_thread(extract_audio_from_video, task_id, video_file_path)
             audio_path_to_clean = audio_path # Mark for cleanup
             original_name = original_video_filename # Ensure original_name is set
             logger.info(f"[{task_id}] Audio extraction complete. Path: {audio_path}, Original Name: {original_name}")
-            _update_progress(task_id, {"status": "processing", "stage": "extracted", "message": "Audio extraction complete."})
+            update_task_progress(task_id, {"status": "processing", "stage": "extracted", "message": "Audio extraction complete."})
         
         else:
             logger.error(f"[{task_id}] No video_file_path or youtube_url provided for transcription.")
             raise ValueError("No input source (video file or YouTube URL) provided for transcription.")
 
         logger.info(f"[{task_id}] Queuing transcription process for '{original_name}' (audio at {audio_path}).")
-        _update_progress(task_id, {"status": "processing", "stage": "transcribing_queued", "message": f"Transcription process for '{original_name}' starting..."})
+        update_task_progress(task_id, {"status": "processing", "stage": "transcribing_queued", "message": f"Transcription process for '{original_name}' starting..."})
         
         # process_audio_to_transcript logs extensively with task_id and original_name
         transcript_path = await asyncio.to_thread(
@@ -430,18 +306,18 @@ async def run_transcription_task(
             audio_path, 
             client, 
             original_name,
-            progress_callback_for_processing 
+            callback_for_processing # Pass the wrapped callback
         )
         
         logger.info(f"[{task_id}] Transcription process for '{original_name}' completed. Transcript at: {transcript_path}")
-        _update_progress(task_id, {"status": "complete", "stage": "finished", "message": f"Transcription for '{original_name}' complete.", "filename": os.path.basename(transcript_path)})
+        update_task_progress(task_id, {"status": "complete", "stage": "finished", "message": f"Transcription for '{original_name}' complete.", "filename": os.path.basename(transcript_path)})
         logger.info(f"[{task_id}] *** BACKGROUND TASK COMPLETED SUCCESSFULLY for '{original_name}'. ***")
 
     except Exception as e:
         # Log the error with task_id and original_name if available
         name_for_log = original_video_filename or youtube_url or "unknown_source"
         logger.error(f"[{task_id}] TASK FAILED for '{name_for_log}': {e}", exc_info=True)
-        _update_progress(task_id, {"status": "error", "stage": "failed", "message": f"Error during transcription for '{name_for_log}': {str(e)}"})
+        update_task_progress(task_id, {"status": "error", "stage": "failed", "message": f"Error during transcription for '{name_for_log}': {str(e)}"})
         logger.info(f"[{task_id}] *** BACKGROUND TASK FAILED for '{name_for_log}'. ***")
     
     finally:
