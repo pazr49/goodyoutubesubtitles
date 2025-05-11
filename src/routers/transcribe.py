@@ -111,7 +111,6 @@ async def transcribe_video(
     background_tasks.add_task(
         run_transcription_task,
         task_id,
-        task_progress_store,
         video_file_path=temp_video_path,
         original_video_filename=video_file.filename,
         youtube_url=None,
@@ -152,7 +151,6 @@ async def transcribe_youtube(
         logger.info(f"[{task_id}] BACKGROUND TASK STARTING PROCESSING")
         await run_transcription_task(
             task_id,
-            task_progress_store,
             video_file_path=None,
             original_video_filename=None,
             youtube_url=url,
@@ -263,64 +261,85 @@ async def download_transcript(filename: str):
 # --- Background task handler ---
 async def run_transcription_task(
     task_id: str,
-    progress_store: Dict[str, Dict[str, Any]],
     video_file_path: Optional[str],
     original_video_filename: Optional[str],
     youtube_url: Optional[str],
-    client
+    client: Any # Assuming client is the ElevenLabs client instance
 ):
-    """Background transcription task, updates progress_store via _update_progress."""
+    """Background transcription task, updates progress via _update_progress."""
     current_task = asyncio.current_task()
     if current_task:
-        current_task.set_name(f"task-{task_id}")
+        current_task.set_name(f"task-{task_id}-{original_video_filename or youtube_url or 'task'}") # More descriptive task name
         
-    logger.info(f"[{task_id}] *** BACKGROUND TASK EXECUTION STARTED ***")
+    logger.info(f"[{task_id}] *** BACKGROUND TASK EXECUTION STARTED for '{original_video_filename or youtube_url}'. ***")
 
-    # Define a simple wrapper for _update_progress to match the Callable[[Dict[str, Any]], None] signature
-    # This also ensures that the task_id is correctly bound for the callback.
     def progress_callback_for_processing(progress_update: Dict[str, Any]):
         _update_progress(task_id, progress_update)
 
-    try:
-        # Step 1: Audio preparation (offloaded to thread)
-        if youtube_url:
-            _update_progress(task_id, {"status": "processing", "stage": "download", "message": "Downloading audio from YouTube..."})
-            audio_path, original_name = await asyncio.to_thread(_download_youtube_sync, task_id, youtube_url)
-            _update_progress(task_id, {"status": "processing", "stage": "downloaded", "message": "YouTube audio downloaded."})
-        else:
-            _update_progress(task_id, {"status": "processing", "stage": "extract", "message": "Extracting audio from uploaded video..."})
-            # Assuming extract_audio_from_video also takes task_id first if it logs, and then a callback
-            audio_path = await asyncio.to_thread(extract_audio_from_video, task_id, video_file_path) # Pass task_id if needed by extract_audio_from_video
-            _update_progress(task_id, {"status": "processing", "stage": "extracted", "message": "Audio extraction complete."})
-            original_name = original_video_filename
+    audio_path_to_clean: Optional[str] = None # Keep track of audio file for cleanup
 
-        # Step 2: Main Transcription (offloaded to thread, with progress callback)
-        _update_progress(task_id, {"status": "processing", "stage": "transcribing_queued", "message": "Transcription process starting..."})
+    try:
+        if youtube_url:
+            logger.info(f"[{task_id}] Preparing to download audio from YouTube: {youtube_url}")
+            _update_progress(task_id, {"status": "processing", "stage": "download", "message": "Downloading audio from YouTube..."})
+            
+            # Note: _download_youtube_sync already logs extensively with task_id
+            audio_path, original_name = await asyncio.to_thread(_download_youtube_sync, task_id, youtube_url)
+            audio_path_to_clean = audio_path # Mark for cleanup
+            logger.info(f"[{task_id}] YouTube audio download complete. Path: {audio_path}, Original Name: {original_name}")
+            _update_progress(task_id, {"status": "processing", "stage": "downloaded", "message": "YouTube audio downloaded."})
         
+        elif video_file_path:
+            logger.info(f"[{task_id}] Preparing to extract audio from video file: {video_file_path}")
+            _update_progress(task_id, {"status": "processing", "stage": "extract", "message": f"Extracting audio from '{original_video_filename}'"})
+            
+            # Note: extract_audio_from_video now takes task_id and logs with it
+            audio_path = await asyncio.to_thread(extract_audio_from_video, task_id, video_file_path)
+            audio_path_to_clean = audio_path # Mark for cleanup
+            original_name = original_video_filename # Ensure original_name is set
+            logger.info(f"[{task_id}] Audio extraction complete. Path: {audio_path}, Original Name: {original_name}")
+            _update_progress(task_id, {"status": "processing", "stage": "extracted", "message": "Audio extraction complete."})
+        
+        else:
+            logger.error(f"[{task_id}] No video_file_path or youtube_url provided for transcription.")
+            raise ValueError("No input source (video file or YouTube URL) provided for transcription.")
+
+        logger.info(f"[{task_id}] Queuing transcription process for '{original_name}' (audio at {audio_path}).")
+        _update_progress(task_id, {"status": "processing", "stage": "transcribing_queued", "message": f"Transcription process for '{original_name}' starting..."})
+        
+        # process_audio_to_transcript logs extensively with task_id and original_name
         transcript_path = await asyncio.to_thread(
             process_audio_to_transcript, 
-            task_id,              # task_id_for_log
+            task_id,              
             audio_path, 
             client, 
             original_name,
-            progress_callback_for_processing # Pass the callback here
+            progress_callback_for_processing 
         )
         
-        # Final completion update (remains the same)
-        _update_progress(task_id, {"status": "complete", "stage": "finished", "message": "Transcription complete.", "filename": os.path.basename(transcript_path)})
-        logger.info(f"[{task_id}] *** BACKGROUND TASK COMPLETED SUCCESSFULLY ***")
+        logger.info(f"[{task_id}] Transcription process for '{original_name}' completed. Transcript at: {transcript_path}")
+        _update_progress(task_id, {"status": "complete", "stage": "finished", "message": f"Transcription for '{original_name}' complete.", "filename": os.path.basename(transcript_path)})
+        logger.info(f"[{task_id}] *** BACKGROUND TASK COMPLETED SUCCESSFULLY for '{original_name}'. ***")
 
     except Exception as e:
-        logger.error(f"[{task_id}] TASK FAILED: {e}", exc_info=True)
-        _update_progress(task_id, {"status": "error", "stage": "failed", "message": str(e)})
-        logger.info(f"[{task_id}] *** BACKGROUND TASK FAILED ***")
+        # Log the error with task_id and original_name if available
+        name_for_log = original_video_filename or youtube_url or "unknown_source"
+        logger.error(f"[{task_id}] TASK FAILED for '{name_for_log}': {e}", exc_info=True)
+        _update_progress(task_id, {"status": "error", "stage": "failed", "message": f"Error during transcription for '{name_for_log}': {str(e)}"})
+        logger.info(f"[{task_id}] *** BACKGROUND TASK FAILED for '{name_for_log}'. ***")
+    
     finally:
-        # Cleanup temp files
-        logger.info(f"[{task_id}] CLEANUP STARTING")
-        if youtube_url and 'temp_audio_path' in locals():
-            logger.info(f"[{task_id}] REMOVING TEMP AUDIO: {audio_path}")
-            clean_temp_file(audio_path)
-        if video_file_path:
-            logger.info(f"[{task_id}] REMOVING TEMP VIDEO: {video_file_path}")
-            clean_temp_file(video_file_path)
-        logger.info(f"[{task_id}] CLEANUP COMPLETE - TASK FINISHED") 
+        name_for_log_cleanup = original_video_filename or youtube_url or "task"
+        logger.info(f"[{task_id}] Starting cleanup for '{name_for_log_cleanup}'.")
+        
+        # Clean the downloaded/extracted audio file
+        if audio_path_to_clean:
+            logger.info(f"[{task_id}] Removing temporary audio file: {audio_path_to_clean}")
+            clean_temp_file(audio_path_to_clean, task_id_for_log=task_id)
+        
+        # Clean the uploaded video file if it exists (it's passed as video_file_path)
+        if video_file_path: # This was the originally uploaded temp file
+            logger.info(f"[{task_id}] Removing temporary uploaded video file: {video_file_path}")
+            clean_temp_file(video_file_path, task_id_for_log=task_id)
+            
+        logger.info(f"[{task_id}] Cleanup complete for '{name_for_log_cleanup}'. TASK FINISHED.") 
