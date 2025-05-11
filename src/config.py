@@ -47,7 +47,7 @@ class Config:
     AUDIO_BITRATE = "320k"
     
     # FFmpeg settings (new)
-    FFMPEG_PATH = r"C:\ffmpeg\bin\ffmpeg.exe"  # Full path to ffmpeg executable
+    FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")  # Use environment variable or default to 'ffmpeg' command
     PREFERRED_AUDIO_FORMAT_FOR_EXTRACTION = "mp3"  # Format for extracted audio
 
 # --- Setup ---
