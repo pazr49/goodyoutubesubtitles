@@ -4,6 +4,7 @@ import shutil
 import logging
 from pathlib import Path # Import Path
 import time # Add for timestamps
+import subprocess # Add subprocess for yt-dlp
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.responses import FileResponse # Import FileResponse
@@ -43,8 +44,8 @@ def _update_progress(task_id: str, progress: Dict[str, Any]):
 # Helper to download YouTube audio in a sync thread
 def _download_youtube_sync(task_id_for_log: str, youtube_url: str) -> tuple[str, str]:
     """Synchronously download YouTube audio and return file path and title."""
-    logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_SYNC: Initializing YouTube object for {youtube_url[:30]}...")
-    yt = YouTube(youtube_url)
+    logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_SYNC: Initializing YouTube object for {youtube_url[:30]}... with use_po_token=True")
+    yt = YouTube(youtube_url, use_po_token=True)
     title = yt.title or "youtube_video"
     logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_SYNC: Video Title - {title}")
     
@@ -70,6 +71,94 @@ def _download_youtube_sync(task_id_for_log: str, youtube_url: str) -> tuple[str,
     logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_SYNC: Download complete in {download_duration:.2f} seconds. Path: {temp_audio_path}")
     
     return temp_audio_path, title
+
+# --- NEW: Helper to download YouTube audio using yt-dlp ---
+def _download_youtube_yt_dlp_sync(task_id_for_log: str, youtube_url: str) -> tuple[str, str]:
+    """Synchronously download YouTube audio using yt-dlp and return file path and title."""
+    logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Starting download for {youtube_url[:50]}...")
+
+    temp_audio_basename = f"{_uuid.uuid4()}_youtube_yt_dlp"
+    # yt-dlp will add the correct extension based on the format chosen
+    # We will tell it to output to a specific path with a specific name pattern
+    # and then find the resulting file.
+    output_template = os.path.join(Config.TEMP_DIR, f"{temp_audio_basename}.%(ext)s")
+    
+    # Get video title first using yt-dlp to get the original name
+    title = "youtube_video" # Default title
+    try:
+        title_command = [
+            "yt-dlp",
+            "--get-title",
+            "--no-warnings",
+            youtube_url
+        ]
+        title_process = subprocess.run(title_command, capture_output=True, text=True, check=True, encoding='utf-8')
+        title = title_process.stdout.strip() or title
+        logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Video Title - {title}")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Failed to get title. stderr: {e.stderr}")
+        # Continue with default title, download might still work
+    except FileNotFoundError:
+        logger.error(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: yt-dlp command not found. Ensure it's installed and in PATH.")
+        raise RuntimeError("yt-dlp not found. Please ensure it's installed and accessible.")
+
+    # Command to download audio
+    # -x: extract audio
+    # --audio-format mp3: convert to mp3 (can be changed via Config if needed)
+    # -o <template>: output template
+    # --no-warnings: suppress warnings
+    # --no-playlist: download only the video if URL is part of a playlist
+    # --ffmpeg-location: path to ffmpeg executable
+    command = [
+        "yt-dlp",
+        "-x", # Extract audio
+        "--audio-format", Config.PREFERRED_AUDIO_FORMAT_FOR_EXTRACTION, # e.g., mp3
+        "-o", output_template,
+        "--ffmpeg-location", Config.FFMPEG_PATH,
+        "--no-warnings",
+        "--no-playlist",
+        youtube_url
+    ]
+
+    logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Executing command: {' '.join(command)}")
+    download_start_time = time.time()
+
+    try:
+        process = subprocess.run(command, capture_output=True, text=True, check=True, encoding='utf-8')
+        if process.stderr:
+            logger.debug(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: yt-dlp stderr: {process.stderr}")
+        if process.stdout:
+            logger.debug(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: yt-dlp stdout: {process.stdout}")
+        
+        download_duration = time.time() - download_start_time
+
+        # yt-dlp adds the extension, so we need to find the exact output file name
+        # This is a bit naive if multiple files match, but given UUID it should be unique
+        expected_extension = Config.PREFERRED_AUDIO_FORMAT_FOR_EXTRACTION
+        temp_audio_path = os.path.join(Config.TEMP_DIR, f"{temp_audio_basename}.{expected_extension}")
+
+        if not os.path.exists(temp_audio_path):
+            # Fallback: list directory to find the file if exact match fails (e.g. if ext was different)
+            logger.warning(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Expected file {temp_audio_path} not found. Searching in TEMP_DIR...")
+            found_files = [f for f in os.listdir(Config.TEMP_DIR) if f.startswith(temp_audio_basename)]
+            if found_files:
+                temp_audio_path = os.path.join(Config.TEMP_DIR, found_files[0])
+                logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Found file {temp_audio_path}")
+            else:
+                logger.error(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Output audio file not found after download for basename {temp_audio_basename}")
+                raise RuntimeError("yt-dlp downloaded, but output file could not be found.")
+
+        logger.info(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Download complete in {download_duration:.2f} seconds. Path: {temp_audio_path}")
+        return temp_audio_path, title
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: yt-dlp failed. Return code: {e.returncode}")
+        logger.error(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: yt-dlp stderr: {e.stderr}")
+        logger.error(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: yt-dlp stdout: {e.stdout}")
+        raise RuntimeError(f"yt-dlp failed: {e.stderr or 'Unknown error'}")
+    except FileNotFoundError: # Should be caught by title check, but as a safeguard
+        logger.error(f"[{task_id_for_log}] _DOWNLOAD_YOUTUBE_YT_DLP_SYNC: yt-dlp command not found. Ensure it's installed and in PATH.")
+        raise RuntimeError("yt-dlp not found. Please ensure it's installed and accessible.")
 
 # --- API Endpoints using the router ---
 @router.get("/ping")
@@ -301,11 +390,17 @@ async def run_transcription_task(
 
     try:
         if youtube_url:
-            logger.info(f"[{task_id}] Preparing to download audio from YouTube: {youtube_url}")
-            _update_progress(task_id, {"status": "processing", "stage": "download", "message": "Downloading audio from YouTube..."})
+            logger.info(f"[{task_id}] Preparing to download audio from YouTube: {youtube_url} using strategy: {Config.YOUTUBE_DOWNLOAD_STRATEGY}")
+            _update_progress(task_id, {"status": "processing", "stage": "download", "message": f"Downloading audio from YouTube ({Config.YOUTUBE_DOWNLOAD_STRATEGY})..."})
             
-            # Note: _download_youtube_sync already logs extensively with task_id
-            audio_path, original_name = await asyncio.to_thread(_download_youtube_sync, task_id, youtube_url)
+            if Config.YOUTUBE_DOWNLOAD_STRATEGY == "yt-dlp":
+                audio_path, original_name = await asyncio.to_thread(_download_youtube_yt_dlp_sync, task_id, youtube_url)
+            elif Config.YOUTUBE_DOWNLOAD_STRATEGY == "pytubefix":
+                audio_path, original_name = await asyncio.to_thread(_download_youtube_sync, task_id, youtube_url)
+            else:
+                logger.error(f"[{task_id}] Invalid YOUTUBE_DOWNLOAD_STRATEGY: {Config.YOUTUBE_DOWNLOAD_STRATEGY}")
+                raise ValueError(f"Invalid YOUTUBE_DOWNLOAD_STRATEGY: {Config.YOUTUBE_DOWNLOAD_STRATEGY}. Choose 'pytubefix' or 'yt-dlp'.")
+
             audio_path_to_clean = audio_path # Mark for cleanup
             logger.info(f"[{task_id}] YouTube audio download complete. Path: {audio_path}, Original Name: {original_name}")
             _update_progress(task_id, {"status": "processing", "stage": "downloaded", "message": "YouTube audio downloaded."})

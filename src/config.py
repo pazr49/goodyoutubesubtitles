@@ -50,6 +50,10 @@ class Config:
     FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")  # Use environment variable or default to 'ffmpeg' command
     PREFERRED_AUDIO_FORMAT_FOR_EXTRACTION = "mp3"  # Format for extracted audio
 
+    # YouTube Download Strategy
+    # Options: "pytubefix", "yt-dlp"
+    YOUTUBE_DOWNLOAD_STRATEGY = os.getenv("YOUTUBE_DOWNLOAD_STRATEGY", "yt-dlp") 
+
 # --- Setup ---
 # Create directory for temporary files
 try:
