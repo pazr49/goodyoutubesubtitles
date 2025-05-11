@@ -1,7 +1,7 @@
 import os
 import logging
 import uuid
-from typing import List, Any
+from typing import List, Any, Callable, Optional, Dict
 import shutil # Added for cleaning up chunk files
 
 from moviepy.video.io.VideoFileClip import VideoFileClip
@@ -309,8 +309,9 @@ def create_transcript_format(
 def process_audio_to_transcript(
     task_id_for_log: str,
     audio_path: str, 
-    client: ElevenLabs, # Type hint added
-    original_name: str
+    client: ElevenLabs, 
+    original_name: str,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
 ) -> str:
     """Process an audio file to generate transcript using chunking"""
     logger.info(f"[{task_id_for_log}] Processing audio file via chunking: {audio_path} (original: {original_name})")
@@ -333,8 +334,21 @@ def process_audio_to_transcript(
 
         # 2. Process each chunk
         logger.info(f"[{task_id_for_log}] Step 2: Processing {len(chunk_files_with_starts)} audio chunks through ElevenLabs...")
+        total_chunks = len(chunk_files_with_starts)
         for i, (chunk_path, chunk_start_s) in enumerate(chunk_files_with_starts):
-            logger.info(f"[{task_id_for_log}] Processing chunk {i+1}/{len(chunk_files_with_starts)}: {chunk_path} (starts at {chunk_start_s}s)")
+            current_chunk_number = i + 1
+            logger.info(f"[{task_id_for_log}] Processing chunk {current_chunk_number}/{total_chunks}: {chunk_path} (starts at {chunk_start_s}s)")
+            
+            # Optional: Send per-chunk processing start update
+            if progress_callback:
+                progress_callback({
+                    "status": "processing", 
+                    "stage": f"transcribing_chunk_{current_chunk_number}_of_{total_chunks}", 
+                    "message": f"Transcribing audio chunk {current_chunk_number} of {total_chunks}...",
+                    "current_chunk": current_chunk_number,
+                    "total_chunks": total_chunks
+                })
+
             try:
                 with open(chunk_path, 'rb') as audio_chunk_file:
                     response = client.speech_to_text.convert(
@@ -343,8 +357,17 @@ def process_audio_to_transcript(
                     )
                 
                 if hasattr(response, 'words') and response.words:
-                    logger.info(f"[{task_id_for_log}] Received {len(response.words)} words from chunk {i+1}.")
+                    logger.info(f"[{task_id_for_log}] Received {len(response.words)} words from chunk {current_chunk_number}.")
                     all_chunk_word_data.append((response.words, chunk_start_s))
+                    # Optional: Send per-chunk completion update
+                    if progress_callback:
+                        progress_callback({
+                            "status": "processing", 
+                            "stage": f"chunk_{current_chunk_number}_of_{total_chunks}_complete", 
+                            "message": f"Completed transcription for chunk {current_chunk_number} of {total_chunks}.",
+                            "current_chunk": current_chunk_number,
+                            "total_chunks": total_chunks
+                        })
                 else:
                     logger.warning(f"[{task_id_for_log}] Empty or invalid transcription response for chunk {chunk_path}. Response: {response}")
             except Exception as e:
@@ -358,6 +381,9 @@ def process_audio_to_transcript(
 
         # 3. Stitch transcriptions
         logger.info(f"[{task_id_for_log}] Step 3: Stitching transcriptions from chunks...")
+        if progress_callback: # <<< Send STITCHING stage update
+            progress_callback({"status": "processing", "stage": "stitching", "message": "Stitching transcriptions from chunks..."})
+        
         stitched_word_objects = _stitch_transcriptions(task_id_for_log, all_chunk_word_data, OVERLAP_S)
         
         if not stitched_word_objects:

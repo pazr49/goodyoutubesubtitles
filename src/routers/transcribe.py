@@ -269,33 +269,47 @@ async def run_transcription_task(
     youtube_url: Optional[str],
     client
 ):
-    """Background transcription task, updates progress_store as it goes."""
-    # Add the task_id to the current asyncio task name for better log correlation
+    """Background transcription task, updates progress_store via _update_progress."""
     current_task = asyncio.current_task()
     if current_task:
         current_task.set_name(f"task-{task_id}")
         
     logger.info(f"[{task_id}] *** BACKGROUND TASK EXECUTION STARTED ***")
+
+    # Define a simple wrapper for _update_progress to match the Callable[[Dict[str, Any]], None] signature
+    # This also ensures that the task_id is correctly bound for the callback.
+    def progress_callback_for_processing(progress_update: Dict[str, Any]):
+        _update_progress(task_id, progress_update)
+
     try:
         # Step 1: Audio preparation (offloaded to thread)
         if youtube_url:
-            logger.info(f"[{task_id}] About to call _update_progress for 'download' stage")
             _update_progress(task_id, {"status": "processing", "stage": "download", "message": "Downloading audio from YouTube..."})
-            logger.info(f"[{task_id}] Calling asyncio.to_thread for _download_youtube_sync")
             audio_path, original_name = await asyncio.to_thread(_download_youtube_sync, task_id, youtube_url)
-            logger.info(f"[{task_id}] _download_youtube_sync completed. Path: {audio_path}, Name: {original_name}")
             _update_progress(task_id, {"status": "processing", "stage": "downloaded", "message": "YouTube audio downloaded."})
         else:
             _update_progress(task_id, {"status": "processing", "stage": "extract", "message": "Extracting audio from uploaded video..."})
-            audio_path = await asyncio.to_thread(extract_audio_from_video, video_file_path)
+            # Assuming extract_audio_from_video also takes task_id first if it logs, and then a callback
+            audio_path = await asyncio.to_thread(extract_audio_from_video, task_id, video_file_path) # Pass task_id if needed by extract_audio_from_video
             _update_progress(task_id, {"status": "processing", "stage": "extracted", "message": "Audio extraction complete."})
             original_name = original_video_filename
 
-        # Step 2: Transcription (offloaded to thread)
-        _update_progress(task_id, {"status": "processing", "stage": "transcribing", "message": "Transcribing audio..."})
-        transcript_path = await asyncio.to_thread(process_audio_to_transcript, task_id, audio_path, client, original_name)
+        # Step 2: Main Transcription (offloaded to thread, with progress callback)
+        _update_progress(task_id, {"status": "processing", "stage": "transcribing_queued", "message": "Transcription process starting..."})
+        
+        transcript_path = await asyncio.to_thread(
+            process_audio_to_transcript, 
+            task_id,              # task_id_for_log
+            audio_path, 
+            client, 
+            original_name,
+            progress_callback_for_processing # Pass the callback here
+        )
+        
+        # Final completion update (remains the same)
         _update_progress(task_id, {"status": "complete", "stage": "finished", "message": "Transcription complete.", "filename": os.path.basename(transcript_path)})
         logger.info(f"[{task_id}] *** BACKGROUND TASK COMPLETED SUCCESSFULLY ***")
+
     except Exception as e:
         logger.error(f"[{task_id}] TASK FAILED: {e}", exc_info=True)
         _update_progress(task_id, {"status": "error", "stage": "failed", "message": str(e)})
