@@ -53,6 +53,7 @@ class Config:
     # YouTube Download Strategy
     # Options: "pytubefix", "yt-dlp"
     YOUTUBE_DOWNLOAD_STRATEGY = os.getenv("YOUTUBE_DOWNLOAD_STRATEGY", "yt-dlp") 
+    YT_DLP_COOKIES_PATH = os.getenv("YT_DLP_COOKIES_PATH", None) # Path to cookies.txt file for yt-dlp
 
 # --- Setup ---
 # Create directory for temporary files

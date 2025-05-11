@@ -88,8 +88,15 @@ def download_youtube_yt_dlp_sync(task_id_for_log: str, youtube_url: str) -> tupl
         "--ffmpeg-location", Config.FFMPEG_PATH,
         "--no-warnings",
         "--no-playlist",
-        youtube_url
+        # Add cookies if specified in config
     ]
+    if Config.YT_DLP_COOKIES_PATH and os.path.exists(Config.YT_DLP_COOKIES_PATH):
+        command.extend(["--cookies", Config.YT_DLP_COOKIES_PATH])
+        logger.info(f"[{task_id_for_log}] DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Using cookies from {Config.YT_DLP_COOKIES_PATH}")
+    elif Config.YT_DLP_COOKIES_PATH: # Path provided but file doesn't exist
+        logger.warning(f"[{task_id_for_log}] DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Cookies path {Config.YT_DLP_COOKIES_PATH} provided but file not found. Proceeding without cookies.")
+
+    command.append(youtube_url) # Add the URL last
 
     logger.info(f"[{task_id_for_log}] DOWNLOAD_YOUTUBE_YT_DLP_SYNC: Executing command: {' '.join(command)}")
     download_start_time = time.time()
@@ -121,6 +128,10 @@ def download_youtube_yt_dlp_sync(task_id_for_log: str, youtube_url: str) -> tupl
 
     except subprocess.CalledProcessError as e:
         logger.error(f"[{task_id_for_log}] DOWNLOAD_YOUTUBE_YT_DLP_SYNC: yt-dlp failed. RC: {e.returncode}. stderr: {e.stderr}. stdout: {e.stdout}")
+        # Check for specific YouTube authentication error
+        if e.stderr and "Sign in to confirm you\'re not a bot" in e.stderr:
+            logger.warning(f"[{task_id_for_log}] DOWNLOAD_YOUTUBE_YT_DLP_SYNC: YouTube authentication required (bot detection).")
+            raise RuntimeError(f"YOUTUBE_AUTH_REQUIRED: {e.stderr}") # Specific prefix for this error
         raise RuntimeError(f"yt-dlp failed: {e.stderr or 'Unknown error'}")
     except FileNotFoundError:
         logger.error(f"[{task_id_for_log}] DOWNLOAD_YOUTUBE_YT_DLP_SYNC: yt-dlp command not found (should have been caught earlier).")
