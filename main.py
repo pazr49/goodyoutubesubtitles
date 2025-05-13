@@ -41,6 +41,9 @@ def create_app() -> FastAPI:
         "http://localhost:5173",
         # Production frontend URL
         "https://ezsubtitles.vercel.app",
+        # New production frontend URLs
+        "https://youtubesubtitlegenerator.com",
+        "https://www.youtubesubtitlegenerator.com",
         # Production API URL (allows API docs served from FastAPI to work, or calls from same domain)
         "https://past-oven-production.up.railway.app", 
     ]
