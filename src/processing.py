@@ -228,6 +228,17 @@ def create_transcript_format(
     segment_start_time = None
     previous_word_end_time = None
     current_char_count = 0
+    PUNCTUATION_TO_ATTACH = {'.', '?', '!'} # Define punctuation that should attach
+
+    # Helper to build segment text, attaching punctuation tokens to preceding words
+    def _assemble_text(words: List[str]) -> str:
+        assembled = []
+        for token in words:
+            if token in PUNCTUATION_TO_ATTACH and assembled:
+                assembled[-1] += token
+            else:
+                assembled.append(token)
+        return " ".join(assembled)
 
     for word_info in words_data:
         if not hasattr(word_info, 'type') or word_info.type != 'word':
@@ -240,49 +251,90 @@ def create_transcript_format(
         word_text = word_info.text
         word_start_time = word_info.start
         word_end_time = word_info.end
-        word_char_count = len(word_text)
+        current_word_char_count = len(word_text) # Use a distinct name
+        is_current_word_standalone_punctuation = word_text in PUNCTUATION_TO_ATTACH
 
-        should_split = False
+        # --- Decision Point 1: Should we split *before* processing the current word_info? ---
+        perform_split_before_this_word = False
+        calculated_gap_before_this_word = None
+
         if current_segment_words and previous_word_end_time is not None:
-            gap = word_start_time - previous_word_end_time
-            
-            if gap > pause_threshold:
-                should_split = True
-            elif ends_with_sentence_end(current_segment_words[-1]): # Relies on current_segment_words having text
-                should_split = True
-            elif (current_char_count + 1 + word_char_count) > max_chars_per_segment:
-                should_split = True
+            calculated_gap_before_this_word = word_start_time - previous_word_end_time
 
-            if should_split and len(current_segment_words) == 1 and gap <= pause_threshold: # Avoid single-word segments unless long pause
-                should_split = False
+            # Reason 1: Previous segment ended with sentence punctuation
+            if ends_with_sentence_end(current_segment_words[-1]):
+                perform_split_before_this_word = True
+            # Reason 2: Adding current word would exceed character limit
+            elif (current_char_count + (1 if current_segment_words else 0) + current_word_char_count) > max_chars_per_segment:
+                # Allow sentence-ending words to overflow and split after
+                if not ends_with_sentence_end(word_text):
+                    perform_split_before_this_word = True
+            # Reason 3: Pause occurred
+            elif calculated_gap_before_this_word > pause_threshold:
+                if not is_current_word_standalone_punctuation:
+                    perform_split_before_this_word = True
+        
+        if perform_split_before_this_word and \
+           len(current_segment_words) == 1 and \
+           not (calculated_gap_before_this_word is not None and calculated_gap_before_this_word > pause_threshold):
+            perform_split_before_this_word = False
 
-        if should_split:
+        if perform_split_before_this_word:
             try:
                 if segment_start_time is not None and previous_word_end_time is not None: 
                     start_str = format_timestamp(segment_start_time)
                     end_str = format_timestamp(previous_word_end_time)
-                    text = " ".join(current_segment_words)
+                    text = _assemble_text(current_segment_words)
                     transcript_segments.append(f"{start_str},{end_str}\n{text}")
             except ValueError as e:
-                logger.error(f"Error formatting timestamp during segment split: {e} (start: {segment_start_time}, end: {previous_word_end_time})")
+                logger.error(f"Error formatting timestamp during segment split (before word): {e} (start: {segment_start_time}, end: {previous_word_end_time})")
+            
+            current_segment_words = []
+            current_char_count = 0
+            segment_start_time = None
+            previous_word_end_time = None
+
+        # --- Process the current word_info: Add it to the (potentially new) segment ---
+        if not current_segment_words:
+            segment_start_time = word_start_time
+
+        current_segment_words.append(word_text)
+        current_char_count += (current_word_char_count + (1 if len(current_segment_words) > 1 else 0))
+        previous_word_end_time = word_end_time # End time is now of the current word
+
+        # --- Decision Point 2: Should we split *after* having added the current word_info? ---
+        perform_split_after_this_word = False
+        
+        if current_segment_words: # Check if there are words in the current segment
+            if ends_with_sentence_end(current_segment_words[-1]):
+                perform_split_after_this_word = True
+            elif is_current_word_standalone_punctuation and \
+                 calculated_gap_before_this_word is not None and \
+                 calculated_gap_before_this_word > pause_threshold:
+                perform_split_after_this_word = True
+        
+        # No anti-single-word logic here, as splitting after specific punctuation or sentence end is usually intended.
+
+        if perform_split_after_this_word:
+            try:
+                if segment_start_time is not None and previous_word_end_time is not None: 
+                    start_str = format_timestamp(segment_start_time)
+                    end_str = format_timestamp(previous_word_end_time)
+                    text = _assemble_text(current_segment_words)
+                    transcript_segments.append(f"{start_str},{end_str}\n{text}")
+            except ValueError as e:
+                logger.error(f"Error formatting timestamp during segment split (after word): {e} (start: {segment_start_time}, end: {previous_word_end_time})")
 
             current_segment_words = []
             current_char_count = 0
             segment_start_time = None
             previous_word_end_time = None
 
-        if not current_segment_words:
-            segment_start_time = word_start_time
-
-        current_segment_words.append(word_text)
-        current_char_count += (word_char_count + (1 if len(current_segment_words) > 1 else 0))
-        previous_word_end_time = word_end_time
-
     if current_segment_words and segment_start_time is not None and previous_word_end_time is not None:
         try:
             start_str = format_timestamp(segment_start_time)
             end_str = format_timestamp(previous_word_end_time)
-            text = " ".join(current_segment_words)
+            text = _assemble_text(current_segment_words)
             transcript_segments.append(f"{start_str},{end_str}\n{text}")
         except ValueError as e:
             logger.error(f"Error formatting timestamp for final segment: {e} (start: {segment_start_time}, end: {previous_word_end_time})")
