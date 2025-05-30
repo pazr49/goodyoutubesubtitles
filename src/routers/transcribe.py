@@ -7,19 +7,20 @@ import time # Add for timestamps
 # subprocess might be removable now from here if not used by other parts
 # import subprocess # Add subprocess for yt-dlp
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Request, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Request, BackgroundTasks, Form
 from fastapi.responses import FileResponse # Import FileResponse
 from sse_starlette.sse import EventSourceResponse
 import asyncio, json
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import uuid as _uuid  # for thread helper
 
 # Import config, models, dependencies, processing, utils
 from ..config import Config, YouTube, PytubeFixError # Go up one level for imports
-from ..models import TranscriptionResponse, YouTubeRequest
-from ..dependencies import get_elevenlabs_client
+from ..models import TranscriptionResponse, YouTubeRequest, VideoUploadRequest
+from ..dependencies import get_elevenlabs_client, get_gemini_client
 from ..processing import extract_audio_from_video, process_audio_to_transcript
 from ..utils import clean_temp_file
+from ..translation import translate_sbv_file
 # NEW: Import for refactored YouTube download functions
 from ..youtube_download import download_youtube_pytubefix_sync, download_youtube_yt_dlp_sync
 # NEW: Import for refactored task management
@@ -55,6 +56,7 @@ async def root():
 async def transcribe_video(
     background_tasks: BackgroundTasks,
     video_file: UploadFile = File(...),
+    target_languages: Optional[str] = Form(default=None, description="Comma-separated list of target languages for translation"),
     client = Depends(get_elevenlabs_client)
 ):
     """Enqueue video transcription and return a task_id for progress streaming."""
@@ -62,6 +64,20 @@ async def transcribe_video(
     file_ext = os.path.splitext(video_file.filename)[1].lower()
     if file_ext not in Config.ALLOWED_VIDEO_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"Invalid file type '{file_ext}'. Allowed: {', '.join(Config.ALLOWED_VIDEO_EXTENSIONS)}")
+    
+    # Parse target languages
+    parsed_target_languages = None
+    if target_languages:
+        parsed_target_languages = [lang.strip() for lang in target_languages.split(',') if lang.strip()]
+    
+    # Get Gemini client if translation is requested
+    gemini_client = None
+    if parsed_target_languages:
+        try:
+            gemini_client = await get_gemini_client()
+        except HTTPException:
+            raise HTTPException(status_code=503, detail="Translation requested but Gemini service not available. Check GEMINI_API_KEY.")
+    
     # Save upload
     temp_video_path = os.path.join(Config.TEMP_DIR, f"{uuid.uuid4()}{file_ext}")
     with open(temp_video_path, "wb") as buf:
@@ -78,7 +94,9 @@ async def transcribe_video(
         video_file_path=temp_video_path,
         original_video_filename=video_file.filename,
         youtube_url=None,
-        client=client
+        target_languages=parsed_target_languages,
+        client=client,
+        gemini_client=gemini_client
     )
     return {"task_id": task_id}
 
@@ -89,6 +107,7 @@ async def transcribe_youtube(
     client = Depends(get_elevenlabs_client)
 ):
     url = str(request.url)
+    target_languages = request.target_languages
     logger.info(f"YOUTUBE REQUEST RECEIVED: {url[:30]}...")
 
     # If pytubefix is the *only* strategy or a possible one, this check is fine.
@@ -97,6 +116,14 @@ async def transcribe_youtube(
     if Config.YOUTUBE_DOWNLOAD_STRATEGY == "pytubefix" and (not YouTube or not PytubeFixError):
         logger.error(f"Pytubefix strategy selected but Pytubefix/YouTube library not available.")
         raise HTTPException(status_code=501, detail="Pytubefix (YouTube) processing dependency not available for selected strategy.")
+    
+    # Get Gemini client if translation is requested
+    gemini_client = None
+    if target_languages:
+        try:
+            gemini_client = await get_gemini_client()
+        except HTTPException:
+            raise HTTPException(status_code=503, detail="Translation requested but Gemini service not available. Check GEMINI_API_KEY.")
     
     task_id = str(uuid.uuid4())
     logger.info(f"[{task_id}] TASK ID GENERATED")
@@ -117,7 +144,9 @@ async def transcribe_youtube(
             video_file_path=None,
             original_video_filename=None,
             youtube_url=url,
-            client=client
+            target_languages=target_languages,
+            client=client,
+            gemini_client=gemini_client
         )
     
     background_tasks.add_task(delayed_task)
@@ -239,7 +268,9 @@ async def run_transcription_task(
     video_file_path: Optional[str],
     original_video_filename: Optional[str],
     youtube_url: Optional[str],
-    client: Any # Assuming client is the ElevenLabs client instance
+    target_languages: Optional[List[str]],
+    client: Any, # Assuming client is the ElevenLabs client instance
+    gemini_client: Any # Assuming gemini_client is the Gemini client instance
 ):
     """Background transcription task, updates progress via _update_progress."""
     current_task = asyncio.current_task()
@@ -300,17 +331,41 @@ async def run_transcription_task(
         update_task_progress(task_id, {"status": "processing", "stage": "transcribing_queued", "message": f"Transcription process for '{original_name}' starting..."})
         
         # process_audio_to_transcript logs extensively with task_id and original_name
-        transcript_path = await asyncio.to_thread(
-            process_audio_to_transcript, 
+        transcript_path = await process_audio_to_transcript( 
             task_id,              
             audio_path, 
             client, 
             original_name,
-            callback_for_processing # Pass the wrapped callback
+            target_languages,
+            callback_for_processing, # Pass the wrapped callback
+            gemini_client
         )
         
         logger.info(f"[{task_id}] Transcription process for '{original_name}' completed. Transcript at: {transcript_path}")
-        update_task_progress(task_id, {"status": "complete", "stage": "finished", "message": f"Transcription for '{original_name}' complete.", "filename": os.path.basename(transcript_path)})
+        
+        # Check for translated files in the temp directory for this task
+        translated_files = []
+        if target_languages:
+            original_filename = Path(transcript_path).stem
+            for language in target_languages:
+                translated_filename = f"{original_filename}_{language}.sbv"
+                translated_path = os.path.join(Config.TEMP_DIR, translated_filename)
+                if os.path.exists(translated_path):
+                    translated_files.append(os.path.basename(translated_path))
+        
+        # Prepare completion message
+        completion_data = {
+            "status": "complete", 
+            "stage": "finished", 
+            "message": f"Transcription for '{original_name}' complete.", 
+            "filename": os.path.basename(transcript_path)
+        }
+        
+        if translated_files:
+            completion_data["translated_files"] = translated_files
+            completion_data["message"] += f" {len(translated_files)} translations created."
+        
+        update_task_progress(task_id, completion_data)
         logger.info(f"[{task_id}] *** BACKGROUND TASK COMPLETED SUCCESSFULLY for '{original_name}'. ***")
 
     except Exception as e:

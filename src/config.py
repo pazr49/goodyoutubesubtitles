@@ -32,6 +32,10 @@ class Config:
     ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
     ELEVENLABS_MODEL_ID = "scribe_v1"
     
+    # Gemini settings for translation
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    GEMINI_MODEL = "gemini-2.0-flash"
+    
     # Storage settings
     TEMP_DIR = "temp_files"
     
@@ -75,4 +79,19 @@ if Config.ELEVENLABS_API_KEY:
         logger.error(f"Failed to initialize ElevenLabs client: {e}")
         # Non-fatal, but endpoints relying on it will fail.
 else:
-    logger.warning("ELEVENLABS_API_KEY not found. ElevenLabs functionality will be disabled.") 
+    logger.warning("ELEVENLABS_API_KEY not found. ElevenLabs functionality will be disabled.")
+
+# Initialize Gemini client for translation
+gemini_client = None
+if Config.GEMINI_API_KEY:
+    try:
+        from google import genai
+        gemini_client = genai.Client(api_key=Config.GEMINI_API_KEY)
+        logger.info("Gemini client initialized successfully.")
+    except ImportError:
+        logger.error("Google GenAI library not found. Install with: pip install google-genai")
+    except Exception as e:
+        logger.error(f"Failed to initialize Gemini client: {e}")
+        # Non-fatal, but translation functionality will fail.
+else:
+    logger.warning("GEMINI_API_KEY not found. Translation functionality will be disabled.") 

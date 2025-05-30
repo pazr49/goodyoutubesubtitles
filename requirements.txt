@@ -13,4 +13,5 @@ aiohttp>=3.8.0
 httpx>=0.28.0
 numpy>=1.25.0
 pillow>=10.0.0
-yt-dlp>=2023.12.30 
+yt-dlp>=2023.12.30
+google-genai>=0.4.0 

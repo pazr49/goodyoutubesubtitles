@@ -5,9 +5,11 @@ import subprocess
 import json
 from typing import List, Any, Callable, Optional, Dict
 import shutil # Added for cleaning up chunk files
+import asyncio
+from pathlib import Path
 
 from moviepy.video.io.VideoFileClip import VideoFileClip
-from elevenlabs.client import ElevenLabs
+from elevenlabs import ElevenLabs
 # Commenting out pydub which has compatibility issues with Python 3.13
 # from pydub import AudioSegment # Added for audio manipulation
 # from pydub.utils import make_chunks # We might use this, or implement manually for overlap
@@ -343,12 +345,14 @@ def create_transcript_format(
     logger.info(f"Formatted transcript with {len(transcript_segments)} segments.")
     return result
 
-def process_audio_to_transcript(
+async def process_audio_to_transcript(
     task_id_for_log: str,
     audio_path: str, 
     client: ElevenLabs, 
     original_name: str,
-    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+    target_languages: Optional[List[str]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    gemini_client: Optional[Any] = None
 ) -> str:
     """Process an audio file to generate transcript using chunking"""
     logger.info(f"[{task_id_for_log}] Starting transcription process for '{original_name}' (path: {audio_path})")
@@ -377,6 +381,7 @@ def process_audio_to_transcript(
         # 2. Process each chunk
         logger.info(f"[{task_id_for_log}] Step 2: Processing {len(chunk_files_with_starts)} audio chunks for '{original_name}' through ElevenLabs.")
         total_chunks = len(chunk_files_with_starts)
+        
         for i, (chunk_path, chunk_start_s) in enumerate(chunk_files_with_starts):
             current_chunk_number = i + 1
             logger.info(f"[{task_id_for_log}] Processing chunk {current_chunk_number}/{total_chunks} for '{original_name}': {chunk_path}")
@@ -439,6 +444,38 @@ def process_audio_to_transcript(
         logger.info(f"[{task_id_for_log}] Step 5: Saving final transcript for '{original_name}'.")
         transcript_path = save_transcript_to_file(transcript_text, original_name, task_id_for_log) # Pass task_id to save_transcript
         logger.info(f"[{task_id_for_log}] Successfully processed '{original_name}'. Transcript at: {transcript_path}")
+        
+        # 6. Handle translations if requested
+        if target_languages and gemini_client:
+            # Import translation function here to avoid circular imports
+            from .translation import translate_sbv_file
+            
+            logger.info(f"[{task_id_for_log}] Step 6: Processing translations for '{original_name}' to languages: {target_languages}")
+            translated_files = []
+            
+            for language in target_languages:
+                logger.info(f"[{task_id_for_log}] Starting translation to {language} for '{original_name}'")
+                
+                try:
+                    translated_path = await translate_sbv_file(
+                        transcript_path,
+                        language,
+                        gemini_client,
+                        task_id_for_log,
+                        original_name,
+                        progress_callback
+                    )
+                    translated_files.append(translated_path)
+                    logger.info(f"[{task_id_for_log}] Translation to {language} completed: {translated_path}")
+                    
+                except Exception as e:
+                    logger.error(f"[{task_id_for_log}] Error translating to {language}: {e}")
+                    # Continue with other languages even if one fails
+                    continue
+            
+            if translated_files:
+                logger.info(f"[{task_id_for_log}] Created {len(translated_files)} translated versions for '{original_name}'")
+        
         return transcript_path
         
     except Exception as e:
