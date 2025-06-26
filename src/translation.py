@@ -95,8 +95,8 @@ async def detect_and_translate_segments(
     translated_segments = []
     total_segments = len(segments)
     
-    # Process segments in batches to avoid overwhelming the API
-    batch_size = 10
+    # Process segments in batches to avoid overwhelming the API (smaller size for reliability)
+    batch_size = 4
     
     for batch_start in range(0, total_segments, batch_size):
         batch_end = min(batch_start + batch_size, total_segments)
@@ -117,32 +117,26 @@ async def detect_and_translate_segments(
             })
         
         try:
-            # Create prompt for Gemini
+            # Create prompt for Gemini – translate EVERY segment unconditionally so no
+            # language-detection ambiguity occurs. Keep numbering so we can map back.
             prompt = f"""
-You are a professional translator. I will provide you with subtitle text segments that may contain multiple languages. 
-Your task is to:
-1. Identify which segments are NOT in {target_language}
-2. Translate those segments to {target_language}
-3. Keep segments that are already in {target_language} unchanged
-4. Maintain the exact same structure and formatting
+You are a professional translator. Translate EACH of the following subtitle segments into {target_language}. 
+Keep the same numbering and do NOT merge or split lines.
 
-Please process the following subtitle segments and return them in the same order:
+Return ONLY the translated segments in this exact format:
+Segment 1: <translated text>
+Segment 2: <translated text>
+...
+
+Do NOT add explanations or extra text.
+
+Here are the segments:
 
 """
             
             for i, text in enumerate(batch_texts):
                 prompt += f"Segment {i+1}: {text}\n"
                 
-            prompt += f"""
-
-Return ONLY the processed segments in this exact format:
-Segment 1: [translated or original text]
-Segment 2: [translated or original text]
-...
-
-Do not include any explanations or additional text. Keep the same numbering and structure.
-"""
-
             # Call Gemini API
             response = await asyncio.to_thread(
                 gemini_client.models.generate_content,

@@ -13,6 +13,7 @@ from sse_starlette.sse import EventSourceResponse
 import asyncio, json
 from typing import Optional, Dict, Any, List
 import uuid as _uuid  # for thread helper
+import re # Import re
 
 # Import config, models, dependencies, processing, utils
 from ..config import Config, YouTube, PytubeFixError # Go up one level for imports
@@ -198,66 +199,215 @@ async def stream_progress(task_id: str, request: Request):
     logger.info(f"[{task_id}] RETURNING EVENT SOURCE RESPONSE")
     return EventSourceResponse(event_generator())
 
-# --- NEW DOWNLOAD ENDPOINT --- 
+# --- ENHANCED DOWNLOAD ENDPOINT --- 
 @router.get("/download/{filename}")
-async def download_transcript(filename: str):
-    """Downloads the specified transcript file (.sbv).
+async def download_transcript(filename: str, file_type: Optional[str] = "processed"):
+    """Downloads transcript files with support for different formats.
     
-    Ensures the file requested is within the temporary directory.
+    Args:
+        filename: Base filename (without extension)
+        file_type: Type of file to download:
+            - "processed": Download .sbv subtitle file (default)
+            - "raw": Download .json file with word-level timestamps
+            - "zip": Download zip file containing all formats (processed, raw, translations)
     """
-    logger.info(f"Received download request for filename: {filename}")
+    from fastapi.responses import StreamingResponse
+    import zipfile
+    import io
+    
+    logger.info(f"Received download request for filename: {filename}, file_type: {file_type}")
     
     # Basic sanitization: remove potential path traversal characters
-    # Although Path() helps, double sanitization is often good practice.
     safe_filename = filename.replace("..", "").replace("/", "").replace("\\", "")
     if safe_filename != filename:
         logger.warning(f"Attempted download with potentially unsafe filename: {filename}")
         raise HTTPException(status_code=400, detail="Invalid filename format.")
 
     try:
-        # Construct the full path safely
-        base_path = Path(Config.TEMP_DIR).resolve() # Get absolute path of TEMP_DIR
-        file_path = (base_path / safe_filename).resolve()
+        # Construct the base path safely
+        base_path = Path(Config.TEMP_DIR).resolve()
+        
+        # Regex to find the main SBV file (ends in _<8-char-uuid>.sbv)
+        # This helps distinguish it from translated files like _<uuid>_spanish.sbv
+        main_sbv_pattern = re.compile(rf"^{re.escape(safe_filename)}_[a-f0-9]{{8}}\.sbv$")
+        
+        if file_type == "processed":
+            import glob
+            # Find the main processed SBV file
+            all_sbv_files = glob.glob(os.path.join(Config.TEMP_DIR, f"{safe_filename}_*.sbv"))
+            main_processed_file = next((f for f in all_sbv_files if main_sbv_pattern.match(os.path.basename(f))), None)
+            
+            if main_processed_file:
+                file_path = Path(main_processed_file).resolve()
+                if not str(file_path).startswith(str(base_path)):
+                    logger.error(f"Path traversal attempt detected for filename: {filename} -> {file_path}")
+                    raise HTTPException(status_code=403, detail="Access forbidden.")
+                
+                logger.info(f"Serving processed file: {file_path}")
+                return FileResponse(
+                    path=file_path,
+                    filename=f"{safe_filename}.sbv",
+                    media_type='text/plain'
+                )
+            else:
+                logger.warning(f"Processed transcript file not found for base name: {safe_filename}")
+                raise HTTPException(status_code=404, detail="Processed transcript file not found.")
+                
+        elif file_type == "raw":
+            import glob
+            # Find raw file. Assume it's the most recent one matching the pattern.
+            pattern = os.path.join(Config.TEMP_DIR, f"{safe_filename}_*_raw.json")
+            matching_files = glob.glob(pattern)
+            
+            if matching_files:
+                file_path = Path(max(matching_files, key=os.path.getmtime)).resolve()
+                if not str(file_path).startswith(str(base_path)):
+                    logger.error(f"Path traversal attempt detected for filename: {filename} -> {file_path}")
+                    raise HTTPException(status_code=403, detail="Access forbidden.")
+                    
+                logger.info(f"Serving raw file: {file_path}")
+                return FileResponse(
+                    path=file_path,
+                    filename=f"{safe_filename}_raw.json",
+                    media_type='application/json'
+                )
+            else:
+                logger.warning(f"Raw transcript file not found for pattern: {pattern}")
+                raise HTTPException(status_code=404, detail="Raw transcript file not found.")
+                
+        elif file_type == "zip":
+            import glob
+            files_to_zip = []
 
-        # SECURITY CHECK: Ensure the resolved file path is still within the base_path directory
-        if not str(file_path).startswith(str(base_path)):
-            logger.error(f"Path traversal attempt detected for filename: {filename} -> {file_path}")
-            raise HTTPException(status_code=403, detail="Access forbidden.")
+            # 1. Find the main processed SBV file
+            all_sbv_files = glob.glob(os.path.join(Config.TEMP_DIR, f"{safe_filename}_*.sbv"))
+            main_processed_file = next((f for f in all_sbv_files if main_sbv_pattern.match(os.path.basename(f))), None)
+
+            if not main_processed_file:
+                logger.warning(f"No main transcript file found for '{safe_filename}' to create a zip.")
+                raise HTTPException(status_code=404, detail="No main transcript file found to create a zip archive.")
             
-        # Check if file exists and is a file
-        if file_path.is_file():
-            logger.info(f"Serving file: {file_path}")
-            # Return the file as a response
-            return FileResponse(
-                path=file_path,
-                filename=safe_filename, # Suggest filename to browser
-                media_type='text/plain' # Explicitly set for .sbv if needed, else FileResponse guesses
+            main_processed_path = Path(main_processed_file).resolve()
+            if not str(main_processed_path).startswith(str(base_path)):
+                raise HTTPException(status_code=403, detail="Access forbidden.")
+            files_to_zip.append((main_processed_path, f"{safe_filename}.sbv"))
+
+            # From the main file, get the full stem with UUID
+            stem_with_uuid = main_processed_path.stem
+
+            # 2. Find the raw JSON file using the full stem
+            raw_path = base_path / f"{stem_with_uuid}_raw.json"
+            if raw_path.exists():
+                files_to_zip.append((raw_path, f"{safe_filename}_raw.json"))
+
+            # 3. Find all translated files
+            translation_pattern = os.path.join(Config.TEMP_DIR, f"{stem_with_uuid}_*.sbv")
+            for f_path in glob.glob(translation_pattern):
+                # Add to zip, but skip the main file which is already included
+                if os.path.basename(f_path) != main_processed_path.name:
+                    translated_path = Path(f_path).resolve()
+                    if str(translated_path).startswith(str(base_path)):
+                        # E.g., MyVideo_uuid_spanish.sbv -> MyVideo_spanish.sbv
+                        lang_suffix = Path(f_path).stem.split(stem_with_uuid + '_')[-1]
+                        arc_name = f"{safe_filename}_{lang_suffix}.sbv"
+                        files_to_zip.append((translated_path, arc_name))
+            
+            if not files_to_zip:
+                logger.warning(f"No transcript files found for: {filename}")
+                raise HTTPException(status_code=404, detail="No transcript files found.")
+            
+            # Create zip file in memory
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                for file_path, arc_name in files_to_zip:
+                    zip_file.write(file_path, arc_name)
+            
+            zip_buffer.seek(0)
+            logger.info(f"Serving zip file with {len(files_to_zip)} files for: {filename}")
+            
+            return StreamingResponse(
+                io.BytesIO(zip_buffer.read()),
+                media_type="application/zip",
+                headers={"Content-Disposition": f"attachment; filename={safe_filename}_transcripts.zip"}
             )
-        else:
-            logger.warning(f"Requested transcript file not found: {file_path}")
-            raise HTTPException(status_code=404, detail="File not found.")
             
+        else:
+            logger.warning(f"Invalid file_type requested: {file_type}")
+            raise HTTPException(status_code=400, detail="Invalid file_type. Use 'processed', 'raw', or 'zip'.")
+            
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
     except Exception as e:
         logger.error(f"Error during file download for {filename}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error while retrieving file.") 
 
 @router.get("/list-files")
 async def list_files():
-    """Lists all files in the temp directory."""
+    """Lists all files in the temp directory, grouped by transcript sets."""
     try:
         files = []
+        file_groups = {}
+        
         for filename in os.listdir(Config.TEMP_DIR):
             file_path = os.path.join(Config.TEMP_DIR, filename)
             if os.path.isfile(file_path):
                 size = os.path.getsize(file_path)
                 modified = os.path.getmtime(file_path)
-                files.append({
+                
+                file_info = {
                     "name": filename,
                     "size_bytes": size,
                     "modified": modified,
-                    "type": "sbv" if filename.endswith(".sbv") else "other"
-                })
-        return {"files": files}
+                    "type": "sbv" if filename.endswith(".sbv") else "json" if filename.endswith(".json") else "other"
+                }
+                
+                # Group related files together
+                if filename.endswith(".sbv") or filename.endswith("_raw.json"):
+                    # Extract base name (remove UUID and extension)
+                    base_name = filename
+                    if filename.endswith("_raw.json"):
+                        base_name = filename[:-9]  # Remove "_raw.json"
+                    elif filename.endswith(".sbv"):
+                        base_name = filename[:-4]   # Remove ".sbv"
+                    
+                    # Remove UUID suffix if present
+                    if '_' in base_name:
+                        parts = base_name.split('_')
+                        if len(parts) > 1 and len(parts[-1]) == 8:  # UUID is 8 chars
+                            base_name = '_'.join(parts[:-1])
+                    
+                    if base_name not in file_groups:
+                        file_groups[base_name] = {
+                            "base_name": base_name,
+                            "files": [],
+                            "latest_modified": modified
+                        }
+                    
+                    file_groups[base_name]["files"].append(file_info)
+                    file_groups[base_name]["latest_modified"] = max(file_groups[base_name]["latest_modified"], modified)
+                else:
+                    files.append(file_info)
+        
+        # Convert grouped files to list format
+        grouped_files = []
+        for group_name, group_data in file_groups.items():
+            grouped_files.append({
+                "group_name": group_name,
+                "files": sorted(group_data["files"], key=lambda x: x["name"]),
+                "latest_modified": group_data["latest_modified"],
+                "file_count": len(group_data["files"])
+            })
+        
+        # Sort groups by latest modification time
+        grouped_files.sort(key=lambda x: x["latest_modified"], reverse=True)
+        
+        return {
+            "grouped_files": grouped_files,
+            "individual_files": sorted(files, key=lambda x: x["modified"], reverse=True),
+            "total_groups": len(grouped_files),
+            "total_individual_files": len(files)
+        }
     except Exception as e:
         logger.error(f"Error listing files: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -331,7 +481,7 @@ async def run_transcription_task(
         update_task_progress(task_id, {"status": "processing", "stage": "transcribing_queued", "message": f"Transcription process for '{original_name}' starting..."})
         
         # process_audio_to_transcript logs extensively with task_id and original_name
-        transcript_path = await process_audio_to_transcript( 
+        processed_path = await process_audio_to_transcript( 
             task_id,              
             audio_path, 
             client, 
@@ -341,24 +491,35 @@ async def run_transcription_task(
             gemini_client
         )
         
-        logger.info(f"[{task_id}] Transcription process for '{original_name}' completed. Transcript at: {transcript_path}")
+        logger.info(f"[{task_id}] Transcription process for '{original_name}' completed. Processed transcript at: {processed_path}")
         
         # Check for translated files in the temp directory for this task
         translated_files = []
         if target_languages:
-            original_filename = Path(transcript_path).stem
+            original_filename = Path(processed_path).stem
             for language in target_languages:
                 translated_filename = f"{original_filename}_{language}.sbv"
                 translated_path = os.path.join(Config.TEMP_DIR, translated_filename)
                 if os.path.exists(translated_path):
                     translated_files.append(os.path.basename(translated_path))
         
+        # Extract base filename for dual-file downloads (remove .sbv extension and UUID)
+        base_filename = Path(processed_path).stem
+        # Remove the UUID suffix to get clean base name for downloads
+        if '_' in base_filename:
+            # Split by underscore and remove the last part (UUID)
+            parts = base_filename.split('_')
+            if len(parts) > 1 and len(parts[-1]) == 8:  # UUID is 8 chars
+                base_filename = '_'.join(parts[:-1])
+        
         # Prepare completion message
         completion_data = {
             "status": "complete", 
             "stage": "finished", 
             "message": f"Transcription for '{original_name}' complete.", 
-            "filename": os.path.basename(transcript_path)
+            "filename": base_filename,  # Use base filename for dual-file downloads
+            "processed_file": os.path.basename(processed_path),
+            "raw_file": os.path.basename(processed_path).replace('.sbv', '_raw.json')
         }
         
         if translated_files:

@@ -1,7 +1,7 @@
 import os
 import uuid
 import logging
-from typing import Optional
+from typing import Optional, List, Any
 import time
 
 from .config import Config # Relative import
@@ -68,6 +68,168 @@ def save_transcript_to_file(
         raise
     except Exception as e: # Catch any other potential errors, like related to Config access
         logger.error(f"{log_prefix}An unexpected error occurred while saving transcript to {transcript_path}: {e}", exc_info=True)
+        raise
+
+def save_raw_transcript_to_file(
+    words_data: List[Any],
+    original_filename: str,
+    task_id_for_log: Optional[str] = None
+) -> str:
+    """Saves the raw word-level transcript data to a JSON file."""
+    import json
+    import time
+    
+    log_prefix = f"[{task_id_for_log}] " if task_id_for_log else ""
+    
+    base_name = os.path.splitext(original_filename)[0]
+    # Sanitize base_name: replace non-alphanumeric (excluding space, underscore, hyphen) with underscore, limit length
+    safe_base_name = "".join(c if c.isalnum() or c in (' ', '_', '-') else '_' for c in base_name).strip()
+    safe_base_name = safe_base_name.replace(' ', '_') # Replace spaces with underscores
+    safe_base_name = safe_base_name[:50] # Limit length to avoid overly long filenames
+
+    # Use a generic but unique name if safe_base_name becomes empty after sanitization
+    if not safe_base_name:
+        safe_base_name = "transcript"
+
+    raw_filename = f"{safe_base_name}_{uuid.uuid4().hex[:8]}_raw.json"
+    temp_dir = getattr(__import__('src.config', fromlist=['Config']).Config, 'TEMP_DIR', 'temp_files')
+    raw_path = os.path.join(temp_dir, raw_filename)
+
+    try:
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Convert words data to JSON-serializable format
+        words_json = []
+        total_duration = 0.0
+        
+        for word_info in words_data:
+            if hasattr(word_info, 'type') and word_info.type == 'word':
+                word_dict = {
+                    'text': word_info.text,
+                    'start': word_info.start,
+                    'end': word_info.end,
+                    'type': 'word'
+                }
+                words_json.append(word_dict)
+                total_duration = max(total_duration, word_info.end)
+        
+        # Create metadata
+        metadata = {
+            'original_filename': original_filename,
+            'total_words': len(words_json),
+            'duration': total_duration,
+            'created_at': time.time(),
+            'format': 'word_level_timestamps'
+        }
+        
+        # Create final JSON structure
+        raw_data = {
+            'metadata': metadata,
+            'words': words_json
+        }
+        
+        with open(raw_path, "w", encoding="utf-8") as f:
+            json.dump(raw_data, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"{log_prefix}Raw transcript saved successfully to: {raw_path} ({len(words_json)} words, {total_duration:.1f}s)")
+        return raw_path
+        
+    except IOError as e:
+        logger.error(f"{log_prefix}Failed to save raw transcript to {raw_path}: {e}", exc_info=True)
+        raise
+    except Exception as e:
+        logger.error(f"{log_prefix}An unexpected error occurred while saving raw transcript to {raw_path}: {e}", exc_info=True)
+        raise
+
+def save_both_transcripts(
+    transcript_text: str,
+    words_data: List[Any],
+    original_filename: str,
+    task_id_for_log: Optional[str] = None
+) -> tuple[str, str]:
+    """Saves both processed (.sbv) and raw (.json) transcript files.
+    
+    Returns:
+        tuple: (processed_file_path, raw_file_path)
+    """
+    log_prefix = f"[{task_id_for_log}] " if task_id_for_log else ""
+    
+    base_name = os.path.splitext(original_filename)[0]
+    # Sanitize base_name: replace non-alphanumeric (excluding space, underscore, hyphen) with underscore, limit length
+    safe_base_name = "".join(c if c.isalnum() or c in (' ', '_', '-') else '_' for c in base_name).strip()
+    safe_base_name = safe_base_name.replace(' ', '_') # Replace spaces with underscores
+    safe_base_name = safe_base_name[:50] # Limit length to avoid overly long filenames
+
+    # Use a generic but unique name if safe_base_name becomes empty after sanitization
+    if not safe_base_name:
+        safe_base_name = "transcript"
+
+    # Generate unique identifier for this pair of files
+    unique_id = uuid.uuid4().hex[:8]
+    
+    # Create filenames using the same base name
+    processed_filename = f"{safe_base_name}_{unique_id}.sbv"
+    raw_filename = f"{safe_base_name}_{unique_id}_raw.json"
+    
+    temp_dir = getattr(__import__('src.config', fromlist=['Config']).Config, 'TEMP_DIR', 'temp_files')
+    processed_path = os.path.join(temp_dir, processed_filename)
+    raw_path = os.path.join(temp_dir, raw_filename)
+
+    try:
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Save processed transcript
+        with open(processed_path, "w", encoding="utf-8") as f:
+            f.write(transcript_text)
+        
+        # Save raw transcript
+        import json
+        import time
+        
+        # Convert words data to JSON-serializable format
+        words_json = []
+        total_duration = 0.0
+        
+        for word_info in words_data:
+            if hasattr(word_info, 'type') and word_info.type == 'word':
+                word_dict = {
+                    'text': word_info.text,
+                    'start': word_info.start,
+                    'end': word_info.end,
+                    'type': 'word'
+                }
+                words_json.append(word_dict)
+                total_duration = max(total_duration, word_info.end)
+        
+        # Create metadata
+        metadata = {
+            'original_filename': original_filename,
+            'total_words': len(words_json),
+            'duration': total_duration,
+            'created_at': time.time(),
+            'format': 'word_level_timestamps'
+        }
+        
+        # Create final JSON structure
+        raw_data = {
+            'metadata': metadata,
+            'words': words_json
+        }
+        
+        with open(raw_path, "w", encoding="utf-8") as f:
+            json.dump(raw_data, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"{log_prefix}Both transcripts saved successfully:")
+        logger.info(f"{log_prefix}  Processed: {processed_path}")
+        logger.info(f"{log_prefix}  Raw: {raw_path} ({len(words_json)} words, {total_duration:.1f}s)")
+        
+        return processed_path, raw_path
+        
+    except IOError as e:
+        logger.error(f"{log_prefix}Failed to save transcripts: {e}", exc_info=True)
+        raise
+    except Exception as e:
+        logger.error(f"{log_prefix}An unexpected error occurred while saving transcripts: {e}", exc_info=True)
         raise
 
 def clean_temp_file(file_path: str, task_id_for_log: Optional[str] = None):

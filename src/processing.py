@@ -15,7 +15,7 @@ from elevenlabs import ElevenLabs
 # from pydub.utils import make_chunks # We might use this, or implement manually for overlap
 
 from .config import Config # Relative imports
-from .utils import format_timestamp, ends_with_sentence_end, save_transcript_to_file, clean_temp_file # Added clean_temp_file
+from .utils import format_timestamp, ends_with_sentence_end, save_transcript_to_file, save_both_transcripts, clean_temp_file # Added save_both_transcripts and clean_temp_file
 
 logger = logging.getLogger(__name__)
 
@@ -365,9 +365,14 @@ async def process_audio_to_transcript(
     all_chunk_word_data = [] # Stores (word_list_from_chunk, chunk_start_time_s)
 
     try:
-        # 1. Split audio into chunks
-        logger.info(f"[{task_id_for_log}] Step 1: Splitting audio into chunks for '{original_name}'.")
-        chunk_files_with_starts = _split_audio_into_chunks(task_id_for_log, audio_path, original_name)
+        # 1. Split audio into chunks (run synchronously in a worker thread so we don't block the event loop)
+        logger.info(f"[{task_id_for_log}] Step 1: Splitting audio into chunks for '{original_name}'. (running in background thread)")
+        chunk_files_with_starts = await asyncio.to_thread(
+            _split_audio_into_chunks,
+            task_id_for_log,
+            audio_path,
+            original_name
+        )
         
         if not chunk_files_with_starts:
             logger.warning(f"[{task_id_for_log}] Audio splitting yielded no chunks for '{original_name}'. Aborting transcription.")
@@ -396,11 +401,16 @@ async def process_audio_to_transcript(
                 })
 
             try:
-                with open(chunk_path, 'rb') as audio_chunk_file:
-                    response = client.speech_to_text.convert(
-                        file=audio_chunk_file,
-                        model_id=Config.ELEVENLABS_MODEL_ID
-                    )
+                # Run the blocking ElevenLabs API call in a thread to keep the event loop free
+                def _convert_sync(fp: str) -> Any:
+                    """Helper to run the ElevenLabs convert call synchronously."""
+                    with open(fp, 'rb') as audio_chunk_file:
+                        return client.speech_to_text.convert(
+                            file=audio_chunk_file,
+                            model_id=Config.ELEVENLABS_MODEL_ID
+                        )
+
+                response = await asyncio.to_thread(_convert_sync, chunk_path)
                 
                 if hasattr(response, 'words') and response.words:
                     logger.info(f"[{task_id_for_log}] Received {len(response.words)} words from chunk {current_chunk_number} for '{original_name}'.")
@@ -440,10 +450,10 @@ async def process_audio_to_transcript(
         logger.info(f"[{task_id_for_log}] Step 4: Formatting final stitched transcript for '{original_name}'.")
         transcript_text = create_transcript_format(stitched_word_objects)
         
-        # 5. Save to file
-        logger.info(f"[{task_id_for_log}] Step 5: Saving final transcript for '{original_name}'.")
-        transcript_path = save_transcript_to_file(transcript_text, original_name, task_id_for_log) # Pass task_id to save_transcript
-        logger.info(f"[{task_id_for_log}] Successfully processed '{original_name}'. Transcript at: {transcript_path}")
+        # 5. Save both transcript formats
+        logger.info(f"[{task_id_for_log}] Step 5: Saving both transcript formats for '{original_name}'.")
+        processed_path, raw_path = save_both_transcripts(transcript_text, stitched_word_objects, original_name, task_id_for_log)
+        logger.info(f"[{task_id_for_log}] Successfully processed '{original_name}'. Processed: {processed_path}, Raw: {raw_path}")
         
         # 6. Handle translations if requested
         if target_languages and gemini_client:
@@ -458,7 +468,7 @@ async def process_audio_to_transcript(
                 
                 try:
                     translated_path = await translate_sbv_file(
-                        transcript_path,
+                        processed_path,
                         language,
                         gemini_client,
                         task_id_for_log,
@@ -476,7 +486,7 @@ async def process_audio_to_transcript(
             if translated_files:
                 logger.info(f"[{task_id_for_log}] Created {len(translated_files)} translated versions for '{original_name}'")
         
-        return transcript_path
+        return processed_path
         
     except Exception as e:
         logger.error(f"[{task_id_for_log}] Critical error during transcription process for '{original_name}': {str(e)}", exc_info=True)
