@@ -60,11 +60,11 @@ async def transcribe_video(
     target_languages: Optional[str] = Form(default=None, description="Comma-separated list of target languages for translation"),
     client = Depends(get_elevenlabs_client)
 ):
-    """Enqueue video transcription and return a task_id for progress streaming."""
-    # Validate file type
+    """Enqueue video or audio file transcription and return a task_id for progress streaming."""
+    # Validate file type - now accepts both video and audio files
     file_ext = os.path.splitext(video_file.filename)[1].lower()
-    if file_ext not in Config.ALLOWED_VIDEO_EXTENSIONS:
-        raise HTTPException(status_code=400, detail=f"Invalid file type '{file_ext}'. Allowed: {', '.join(Config.ALLOWED_VIDEO_EXTENSIONS)}")
+    if file_ext not in Config.ALLOWED_FILE_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Invalid file type '{file_ext}'. Allowed: {', '.join(Config.ALLOWED_FILE_EXTENSIONS)}")
     
     # Parse target languages
     parsed_target_languages = None
@@ -463,15 +463,29 @@ async def run_transcription_task(
             update_task_progress(task_id, {"status": "processing", "stage": "downloaded", "message": "YouTube audio downloaded."})
         
         elif video_file_path:
-            logger.info(f"[{task_id}] Preparing to extract audio from video file: {video_file_path}")
-            update_task_progress(task_id, {"status": "processing", "stage": "extract", "message": f"Extracting audio from '{original_video_filename}'"})
+            file_ext = os.path.splitext(video_file_path)[1].lower()
             
-            # Note: extract_audio_from_video now takes task_id and logs with it
-            audio_path = await asyncio.to_thread(extract_audio_from_video, task_id, video_file_path)
-            audio_path_to_clean = audio_path # Mark for cleanup
-            original_name = original_video_filename # Ensure original_name is set
-            logger.info(f"[{task_id}] Audio extraction complete. Path: {audio_path}, Original Name: {original_name}")
-            update_task_progress(task_id, {"status": "processing", "stage": "extracted", "message": "Audio extraction complete."})
+            # Check if it's an audio file that doesn't need extraction
+            if file_ext in Config.ALLOWED_AUDIO_EXTENSIONS:
+                logger.info(f"[{task_id}] Audio file detected, using directly: {video_file_path}")
+                update_task_progress(task_id, {"status": "processing", "stage": "extract", "message": f"Processing audio file '{original_video_filename}'"})
+                
+                audio_path = video_file_path  # Use the audio file directly
+                audio_path_to_clean = None  # Don't clean the original file, we'll clean it in finally
+                original_name = original_video_filename
+                logger.info(f"[{task_id}] Audio file ready for transcription. Path: {audio_path}, Original Name: {original_name}")
+                update_task_progress(task_id, {"status": "processing", "stage": "extracted", "message": "Audio file ready for transcription."})
+            else:
+                # It's a video file, extract audio
+                logger.info(f"[{task_id}] Preparing to extract audio from video file: {video_file_path}")
+                update_task_progress(task_id, {"status": "processing", "stage": "extract", "message": f"Extracting audio from '{original_video_filename}'"})
+                
+                # Note: extract_audio_from_video now takes task_id and logs with it
+                audio_path = await asyncio.to_thread(extract_audio_from_video, task_id, video_file_path)
+                audio_path_to_clean = audio_path # Mark for cleanup
+                original_name = original_video_filename # Ensure original_name is set
+                logger.info(f"[{task_id}] Audio extraction complete. Path: {audio_path}, Original Name: {original_name}")
+                update_task_progress(task_id, {"status": "processing", "stage": "extracted", "message": "Audio extraction complete."})
         
         else:
             logger.error(f"[{task_id}] No video_file_path or youtube_url provided for transcription.")

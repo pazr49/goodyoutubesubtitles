@@ -43,8 +43,10 @@ class Config:
     PAUSE_THRESHOLD = 1.0  # Seconds
     MAX_CHARS_PER_SEGMENT = 85  # Approx 2 lines on YouTube
     
-    # Video settings
+    # Video and Audio settings
     ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+    ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".wma"}
+    ALLOWED_FILE_EXTENSIONS = ALLOWED_VIDEO_EXTENSIONS | ALLOWED_AUDIO_EXTENSIONS
     
     # Audio settings
     PREFERRED_AUDIO_FORMAT = "m4a"
